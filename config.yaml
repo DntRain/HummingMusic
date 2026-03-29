@@ -1,0 +1,57 @@
+# HummingMusic 统一配置文件
+
+# 音频处理
+audio:
+  sample_rate: 16000
+  mono: true
+
+# CREPE 音高提取
+crepe:
+  model_capacity: "full"       # tiny, small, medium, large, full
+  confidence_threshold: 0.8
+  step_size: 10                # 帧步长(ms)
+  viterbi: true
+
+# 插值参数
+interpolation:
+  max_nan_duration: 0.2        # 短NaN段插值阈值(秒)
+
+# 量化器
+quantizer:
+  model_path: "models/quantizer/bilstm_crf.pt"
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.3
+  use_crf: true
+
+# 风格迁移
+style_transfer:
+  model_path: "models/style_transfer/vqvae.pt"
+  codebook_size: 512
+  embedding_dim: 64
+  encoder_channels: [64, 128, 256]
+  resolution: 16               # 16分音符分辨率
+  style_vectors_dir: "models/style_transfer/"
+
+# 渲染器
+renderer:
+  soundfont_path: "/usr/share/soundfonts/default.sf2"
+  sample_rate: 44100
+  bit_depth: 16
+
+# 数据目录
+data:
+  humming_dir: "data/humming/"
+  midi_pop_dir: "data/midi_pop/"
+  midi_jazz_dir: "data/midi_jazz/"
+  midi_classical_dir: "data/midi_classical/"
+  midi_folk_dir: "data/midi_folk/"
+  splits_dir: "data/splits/"
+
+# 临时文件
+tmp_dir: "tmp/"
+
+# 日志
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
