@@ -6,7 +6,7 @@ test_audio_processing.py - 音频处理模块单元测试
 
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -30,7 +30,6 @@ class TestExtractPitch:
         """正常2秒440Hz音频应返回合理结果。"""
         audio_path = self._create_test_audio(duration=2.0, freq=440.0)
 
-        # Mock crepe 以避免实际模型加载
         mock_time = np.arange(0, 2.0, 0.01)
         mock_freq = np.full_like(mock_time, 440.0)
         mock_conf = np.full_like(mock_time, 0.95)
@@ -78,7 +77,6 @@ class TestExtractPitch:
 
         mock_time = np.arange(0, 1.0, 0.01)
         mock_freq = np.full_like(mock_time, 440.0)
-        # 前一半置信度很低
         mock_conf = np.concatenate([
             np.full(50, 0.3),
             np.full(50, 0.95),
@@ -92,7 +90,6 @@ class TestExtractPitch:
 
             result = extract_pitch(audio_path)
 
-        # 低置信度帧应有NaN（部分可能被插值修复）
         assert isinstance(result["frequency"], np.ndarray)
         Path(audio_path).unlink(missing_ok=True)
 
@@ -124,24 +121,20 @@ class TestInterpolation:
         """短NaN段应被线性插值修复。"""
         from src.audio_processing import _interpolate_short_gaps
 
-        time = np.arange(0, 1.0, 0.01)  # 100帧，0.01s间隔
+        time = np.arange(0, 1.0, 0.01)
         frequency = np.full(100, 440.0)
-        # 在中间插入3帧NaN（0.03s < 0.2s 阈值）
         frequency[50:53] = np.nan
 
         result = _interpolate_short_gaps(time, frequency)
-        # 短NaN段应被修复
         assert not np.any(np.isnan(result[50:53]))
 
     def test_long_gap_preserved(self):
         """长NaN段应保留。"""
         from src.audio_processing import _interpolate_short_gaps
 
-        time = np.arange(0, 2.0, 0.01)  # 200帧
+        time = np.arange(0, 2.0, 0.01)
         frequency = np.full(200, 440.0)
-        # 插入30帧NaN（0.3s > 0.2s 阈值）
         frequency[50:80] = np.nan
 
         result = _interpolate_short_gaps(time, frequency)
-        # 长NaN段应保留
         assert np.all(np.isnan(result[50:80]))

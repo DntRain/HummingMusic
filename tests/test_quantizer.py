@@ -4,10 +4,17 @@ test_quantizer.py - 容错量化模块单元测试
 覆盖：正常输入、边界输入（单音符、极短序列）、异常输入（全NaN频率）
 """
 
+import sys
+from unittest.mock import MagicMock
+
 import numpy as np
 import pretty_midi
 import pytest
-import torch
+
+# 判断 torch 是否真实可用（非 mock）
+TORCH_AVAILABLE = (
+    "torch" in sys.modules and not isinstance(sys.modules["torch"], MagicMock)
+)
 
 
 class TestPreprocessing:
@@ -56,11 +63,14 @@ class TestPreprocessing:
         assert features.dtype == np.float32
 
 
+@pytest.mark.skipif(not TORCH_AVAILABLE, reason="torch 未安装，CI 中跳过")
 class TestBiLSTMCRF:
-    """BiLSTM-CRF 模型测试。"""
+    """BiLSTM-CRF 模型测试（需要真实 torch）。"""
 
     def test_model_forward(self):
         """模型前向推理应返回正确长度的标签序列。"""
+        import torch
+
         from src.quantizer import BiLSTMCRF
 
         model = BiLSTMCRF(input_dim=4, hidden_size=32, num_layers=1)
@@ -72,11 +82,12 @@ class TestBiLSTMCRF:
 
         assert len(tags) == 1
         assert len(tags[0]) == 50
-        # 所有标签应在 {0, 1, 2} 范围内
         assert all(t in {0, 1, 2} for t in tags[0])
 
     def test_model_batch(self):
         """批量推理应返回对应数量的结果。"""
+        import torch
+
         from src.quantizer import BiLSTMCRF
 
         model = BiLSTMCRF(input_dim=4, hidden_size=32, num_layers=1)

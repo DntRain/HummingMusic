@@ -1,0 +1,13 @@
+# CI 专用依赖（轻量化，跳过难以编译的重型库）
+# crepe 和 torch 在 CI 里用 mock 替代，不安装
+librosa
+pretty_midi
+music21
+matplotlib
+numpy
+pyyaml
+scipy
+soundfile
+pytest
+pytest-cov
+flake8
