@@ -18,12 +18,21 @@ except ImportError:
 
 # ──────────────────────────────────────────────
 # Mock torch 全家桶（CI 不安装）
+# 需要让 torch.Tensor 是一个真正的类，
+# 否则 scipy 的 issubclass(x, torch.Tensor) 会崩溃
 # ──────────────────────────────────────────────
 try:
     import torch  # noqa: F401
     TORCH_AVAILABLE = True
 except ImportError:
+
+    class _FakeTensor:
+        """占位类，让 issubclass() 检查不崩溃。"""
+        pass
+
     _mock_torch = MagicMock()
+    _mock_torch.Tensor = _FakeTensor
+
     for mod in [
         "torch",
         "torch.nn",
