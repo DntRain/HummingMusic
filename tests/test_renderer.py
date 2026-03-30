@@ -8,7 +8,6 @@ import tempfile
 from pathlib import Path
 
 import pretty_midi
-import pytest
 
 
 def _create_test_midi(n_notes: int = 4) -> pretty_midi.PrettyMIDI:

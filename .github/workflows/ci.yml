@@ -32,7 +32,7 @@ jobs:
 
       - name: 代码风格检查 (flake8)
         run: |
-          flake8 src/ tests/ --ignore=E501 --statistics --count
+          flake8 src/ tests/ --ignore=E501,W503 --statistics --count
 
       - name: 运行测试 + 覆盖率
         run: |

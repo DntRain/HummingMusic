@@ -339,7 +339,7 @@ def _load_style_vectors() -> dict[str, np.ndarray]:
     Returns:
         dict[str, np.ndarray]: 风格名 → 参考向量映射。
     """
-    global _style_vectors
+    global _style_vectors  # noqa: F824
     if _style_vectors:
         return _style_vectors
 
@@ -459,8 +459,6 @@ def _generate_chord_progression(
     Returns:
         list[list[int]]: 和弦列表，每个和弦为MIDI音高列表。
     """
-    import music21
-
     tonic_pitch = key.tonic.midi
 
     if key.mode == "minor":

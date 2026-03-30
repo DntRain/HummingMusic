@@ -4,8 +4,6 @@ test_interfaces.py - 接口定义模块测试
 验证接口函数签名和类型约束。
 """
 
-import pytest
-
 
 class TestInterfaceDefinitions:
     """接口定义正确性测试。"""
@@ -32,7 +30,7 @@ class TestInterfaceDefinitions:
 
     def test_protocol_classes_importable(self):
         """协议类应可正常导入。"""
-        from src.interfaces import (
+        from src.interfaces import (  # noqa: F401
             AudioRenderer,
             HummingQuantizer,
             PitchExtractor,
