@@ -418,6 +418,231 @@ def _baseline_quantize(pitch_data: dict) -> pretty_midi.PrettyMIDI:
 
 
 # ──────────────────────────────────────────────
+# RoundingBaselineQuantizer（正式 baseline 类）
+# ──────────────────────────────────────────────
+
+class RoundingBaselineQuantizer:
+    """
+    四舍五入基线量化器。
+
+    将连续 F0 频率直接四舍五入到最近半音（整数 MIDI 编号），
+    作为后续模型对比实验的基准线。
+
+    处理流程:
+        1. 置信度过滤：低于阈值的帧标记为静音 (NaN)
+        2. 短静音插值：短于阈值的静音段用线性插值填充
+        3. F0 → MIDI 转换并四舍五入
+        4. 相邻同音高帧合并为单个音符
+        5. 输出标准 PrettyMIDI 对象
+
+    所有阈值从 config.yaml 的 quantizer 节读取，不硬编码。
+    无需预训练权重，可独立运行。
+
+    实现 interfaces.HummingQuantizer 协议。
+    """
+
+    def __init__(self) -> None:
+        """初始化，从配置文件读取阈值参数。"""
+        self._confidence_threshold: float = _config["quantizer"].get(
+            "confidence_threshold", 0.8
+        )
+        self._silence_threshold: float = _config["quantizer"].get(
+            "silence_threshold", 0.2
+        )
+        self._velocity: int = _config["quantizer"].get(
+            "default_velocity", 80
+        )
+
+    def __call__(self, pitch_data: dict) -> pretty_midi.PrettyMIDI:
+        """
+        将连续音高数据量化为离散 MIDI 音符序列。
+
+        Args:
+            pitch_data: extract_pitch 的输出字典，包含:
+                - time (np.ndarray): 时间戳数组，单位秒，shape=(N,)
+                - frequency (np.ndarray): 基频数组，单位Hz，shape=(N,)
+                - confidence (np.ndarray): 置信度数组，范围[0,1]，shape=(N,)
+                - bpm (float): 估计的每分钟节拍数
+
+        Returns:
+            pretty_midi.PrettyMIDI: 量化后的MIDI对象，包含单个旋律轨道，
+                力度统一为 config 中的 default_velocity。
+        """
+        time = pitch_data["time"]
+        frequency = pitch_data["frequency"].copy()
+        confidence = pitch_data["confidence"]
+        bpm = pitch_data["bpm"]
+
+        logger.info(
+            "RoundingBaselineQuantizer: %d 帧, BPM=%.1f",
+            len(time), bpm,
+        )
+
+        # 1. 置信度过滤
+        frequency = self._filter_by_confidence(frequency, confidence)
+
+        # 2. 短静音段线性插值
+        frequency = self._interpolate_short_silences(time, frequency)
+
+        # 3. F0 → MIDI → 四舍五入
+        midi_continuous = _freq_to_midi(frequency)
+        midi_rounded = np.where(
+            np.isnan(midi_continuous), np.nan, np.round(midi_continuous)
+        )
+        # 钳制到有效 MIDI 范围 [0, 127]
+        midi_rounded = np.where(
+            np.isnan(midi_rounded), np.nan,
+            np.clip(midi_rounded, 0, 127),
+        )
+
+        # 4. 相邻同音高帧合并
+        notes = self._merge_frames_to_notes(time, midi_rounded)
+
+        logger.info("RoundingBaselineQuantizer: 输出 %d 个音符", len(notes))
+
+        # 5. 转为 PrettyMIDI
+        return _notes_to_midi(notes, bpm)
+
+    def _filter_by_confidence(
+        self, frequency: np.ndarray, confidence: np.ndarray
+    ) -> np.ndarray:
+        """
+        将置信度低于阈值的帧频率置为 NaN。
+
+        Args:
+            frequency: 基频数组 (Hz)，shape=(N,)。
+            confidence: 置信度数组 [0,1]，shape=(N,)。
+
+        Returns:
+            np.ndarray: 过滤后的频率数组，低置信度帧为 NaN。
+        """
+        result = frequency.copy()
+        mask = confidence < self._confidence_threshold
+        result[mask] = np.nan
+        n_filtered = int(np.sum(mask))
+        if n_filtered > 0:
+            logger.debug(
+                "置信度过滤: %d/%d 帧 (阈值=%.2f)",
+                n_filtered, len(frequency), self._confidence_threshold,
+            )
+        return result
+
+    def _interpolate_short_silences(
+        self, time: np.ndarray, frequency: np.ndarray
+    ) -> np.ndarray:
+        """
+        对短于阈值的静音段(NaN)做线性插值，长静音段保留 NaN。
+
+        Args:
+            time: 时间戳数组 (秒)，shape=(N,)。
+            frequency: 频率数组（含NaN），shape=(N,)。
+
+        Returns:
+            np.ndarray: 插值修复后的频率数组。
+        """
+        result = frequency.copy()
+        nan_mask = np.isnan(result)
+
+        if not np.any(nan_mask) or np.all(nan_mask):
+            return result
+
+        # 找连续 NaN 段的起止索引
+        changes = np.diff(nan_mask.astype(int))
+        starts = np.where(changes == 1)[0] + 1
+        ends = np.where(changes == -1)[0] + 1
+
+        if nan_mask[0]:
+            starts = np.concatenate([[0], starts])
+        if nan_mask[-1]:
+            ends = np.concatenate([ends, [len(frequency)]])
+
+        n_interpolated = 0
+        for s, e in zip(starts, ends):
+            gap_duration = time[min(e, len(time) - 1)] - time[s]
+            # 仅对短静音段插值，且两端必须有有效值
+            if gap_duration < self._silence_threshold and s > 0 and e < len(frequency):
+                result[s:e] = np.interp(
+                    time[s:e],
+                    [time[s - 1], time[e]],
+                    [result[s - 1], result[e]],
+                )
+                n_interpolated += 1
+
+        if n_interpolated > 0:
+            logger.debug(
+                "短静音插值: %d 段 (阈值=%.2fs)",
+                n_interpolated, self._silence_threshold,
+            )
+        return result
+
+    def _merge_frames_to_notes(
+        self, time: np.ndarray, midi_rounded: np.ndarray
+    ) -> list[dict]:
+        """
+        将逐帧 MIDI 编号合并为音符事件列表。
+
+        相邻帧若为同一音高则合并为单个音符；
+        NaN 帧视为音符间隔。
+
+        Args:
+            time: 时间戳数组 (秒)，shape=(N,)。
+            midi_rounded: 四舍五入后的 MIDI 编号数组，shape=(N,)。
+
+        Returns:
+            list[dict]: 音符事件列表，每个事件包含:
+                - pitch (int): MIDI 音高 [0, 127]
+                - start (float): 起始时间（秒）
+                - end (float): 结束时间（秒）
+                - velocity (int): 力度
+        """
+        notes: list[dict] = []
+        current_pitch: float | None = None
+        start_time: float = 0.0
+
+        for i in range(len(midi_rounded)):
+            pitch = midi_rounded[i]
+
+            if np.isnan(pitch):
+                # 静音帧：结束当前音符
+                if current_pitch is not None:
+                    notes.append({
+                        "pitch": int(current_pitch),
+                        "start": start_time,
+                        "end": time[i],
+                        "velocity": self._velocity,
+                    })
+                    current_pitch = None
+            elif current_pitch is None or pitch != current_pitch:
+                # 新音高：结束前一个音符，开始新音符
+                if current_pitch is not None:
+                    notes.append({
+                        "pitch": int(current_pitch),
+                        "start": start_time,
+                        "end": time[i],
+                        "velocity": self._velocity,
+                    })
+                current_pitch = pitch
+                start_time = time[i]
+            # else: 同一音高，继续延长
+
+        # 处理序列末尾的音符
+        if current_pitch is not None and len(time) > 0:
+            # 末帧时间 + 一个帧间隔作为结束时间
+            if len(time) >= 2:
+                frame_dur = time[-1] - time[-2]
+            else:
+                frame_dur = 0.01  # 单帧时给一个最小时长
+            notes.append({
+                "pitch": int(current_pitch),
+                "start": start_time,
+                "end": time[-1] + frame_dur,
+                "velocity": self._velocity,
+            })
+
+        return notes
+
+
+# ──────────────────────────────────────────────
 # 模型加载与推理
 # ──────────────────────────────────────────────
 
@@ -485,7 +710,8 @@ def quantize_humming(pitch_data: dict) -> pretty_midi.PrettyMIDI:
 
     model = _load_model()
     if model is None:
-        return _baseline_quantize(pitch_data)
+        baseline = RoundingBaselineQuantizer()
+        return baseline(pitch_data)
 
     # 准备特征
     features = _prepare_features(pitch_data)
