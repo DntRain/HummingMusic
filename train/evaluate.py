@@ -75,7 +75,8 @@ def eval_model(valid_ds, ckpt_path: str) -> float:
 
     from src.quantizer import BiLSTMCRF
     model = BiLSTMCRF(input_dim=4, hidden_size=128, num_layers=2, dropout=0.0)
-    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) else ckpt
     model.load_state_dict(state_dict)
     model.to(device)
 

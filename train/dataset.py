@@ -132,18 +132,30 @@ class HumTransDataset(Dataset):
         return self._extract_features_realtime(key)
 
     def _extract_features_realtime(self, key: str) -> np.ndarray:
-        """实时用 CREPE 提取特征（耗时，建议预提取后使用）。"""
-        try:
-            import crepe
-            import librosa
-        except ImportError as e:
-            raise ImportError("实时提取需要 crepe 和 librosa") from e
+        """实时提取特征：优先 CREPE，不可用时回退到 librosa.pyin。"""
+        import librosa
 
         wav_path = str(self.wav_dir / f"{key}.wav")
         audio, sr = librosa.load(wav_path, sr=16000, mono=True)
-        time, freq, conf, _ = crepe.predict(
-            audio, sr, step_size=FRAME_STEP_MS, viterbi=True
-        )
+
+        try:
+            import crepe
+            time, freq, conf, _ = crepe.predict(
+                audio, sr, step_size=FRAME_STEP_MS, viterbi=True
+            )
+        except ImportError:
+            # 回退：librosa pYIN（已安装，无需 tensorflow）
+            hop = int(sr * FRAME_STEP_S)
+            freq, voiced_flag, voiced_prob = librosa.pyin(
+                audio, sr=sr,
+                fmin=librosa.note_to_hz("C2"),
+                fmax=librosa.note_to_hz("C6"),
+                hop_length=hop,
+                fill_na=0.0,
+            )
+            conf = voiced_prob.astype(np.float64)
+            n = len(freq)
+            time = np.arange(n) * FRAME_STEP_S
 
         midi_notes = 69.0 + 12.0 * np.log2(
             np.where(freq > 0, freq, 440.0) / 440.0

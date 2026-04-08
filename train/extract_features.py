@@ -1,8 +1,8 @@
 """
 train/extract_features.py - 离线特征预提取脚本
 
-使用 CREPE 批量提取 HumTrans 数据集的帧级特征，
-保存为 .npy 文件，供训练时快速加载。
+批量提取 HumTrans 数据集的帧级特征，保存为 .npy 文件。
+优先使用 CREPE（精度高），不可用时回退到 librosa.pyin。
 
 运行示例：
     python -m train.extract_features \\
@@ -46,7 +46,6 @@ def extract_one(
     Returns:
         bool: 成功返回 True，跳过/失败返回 False。
     """
-    import crepe
     import librosa
 
     out_path = feat_dir / f"{key}.npy"
@@ -60,12 +59,27 @@ def extract_one(
 
     try:
         audio, sr = librosa.load(str(wav_path), sr=16000, mono=True)
-        time, freq, conf, _ = crepe.predict(
-            audio, sr,
-            step_size=FRAME_STEP_MS,
-            viterbi=True,
-            model_capacity="full",
-        )
+
+        try:
+            import crepe
+            time, freq, conf, _ = crepe.predict(
+                audio, sr,
+                step_size=FRAME_STEP_MS,
+                viterbi=True,
+                model_capacity="full",
+            )
+        except ImportError:
+            # 回退：librosa pYIN（无需 tensorflow）
+            hop = int(sr * FRAME_STEP_MS / 1000.0)
+            freq, _, voiced_prob = librosa.pyin(
+                audio, sr=sr,
+                fmin=librosa.note_to_hz("C2"),
+                fmax=librosa.note_to_hz("C6"),
+                hop_length=hop,
+                fill_na=0.0,
+            )
+            conf = voiced_prob.astype(np.float64)
+            time = np.arange(len(freq)) * (FRAME_STEP_MS / 1000.0)
 
         # F0 → MIDI 编号
         with np.errstate(divide="ignore", invalid="ignore"):

@@ -21,8 +21,10 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from train.dataset import HumTransDataset, collate_fn
@@ -79,8 +81,20 @@ def crf_nll_loss(
     # 配分函数（前向算法）
     log_Z = _forward_algorithm(crf, emissions, mask)
 
-    loss = (log_Z - score).mean()
-    return loss
+    crf_loss = (log_Z - score).mean()
+
+    # 辅助：帧级加权交叉熵，解决 B 类严重不足问题
+    # 类别权重: O=1, B=50, I=0.5（B 类帧占比~1%，需大幅上调）
+    cls_weight = torch.tensor([1.0, 50.0, 0.5], device=emissions.device)
+    flat_emit = emissions.reshape(-1, K)         # (B*T, K)
+    flat_label = labels.reshape(-1)              # (B*T,)
+    flat_mask = mask.reshape(-1)                 # (B*T,)
+    # 屏蔽 padding 帧（令其 label=-1 被 ignore）
+    masked_label = flat_label.masked_fill(~flat_mask, -1)
+    ce_loss = F.cross_entropy(flat_emit, masked_label,
+                              weight=cls_weight, ignore_index=-1)
+
+    return 0.2 * crf_loss + ce_loss
 
 
 def _forward_algorithm(
@@ -136,23 +150,39 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device) -> 
             mask = batch["mask"].to(device)            # (B, T)
             keys = batch["keys"]
 
-            tag_seqs = model(features, mask)           # list[list[int]]
+            # 用 B 发射分数局部峰值检测解码
+            lstm_out, _ = model.lstm(features)
+            lstm_out = model.dropout(lstm_out)
+            emissions = model.fc(lstm_out)          # (B, T, 3)
+            b_scores = emissions[:, :, 1].cpu().numpy()  # (B, T) B类分数
 
-            for i, tags in enumerate(tag_seqs):
+            for i in range(features.shape[0]):
                 n = batch["n_frames"][i]
                 feat_np = batch["features"][i, :n].numpy()
-                # 特征第0列是 midi_note（连续值）
                 midi_notes_cont = feat_np[:, 0].astype(float)
-                # NaN 处理：is_valid=0 的帧视为 NaN
                 valid_mask = feat_np[:, 1] > 0
                 midi_notes_cont = midi_notes_cont.copy()
                 midi_notes_cont[~valid_mask] = float("nan")
+                time_arr = np.arange(n, dtype=float) * 0.01
 
-                time_arr = (
-                    torch.arange(n).float() * 0.01
-                ).numpy()  # 10ms per frame
+                # 局部峰值：最小间距 20帧(200ms)，最小高度=均值+0.5std
+                from scipy.signal import find_peaks
+                b_seq = b_scores[i, :n]
+                height_thr = b_seq.mean() + 0.5 * b_seq.std()
+                peaks, _ = find_peaks(b_seq, distance=20, height=height_thr)
 
-                notes = _bio_to_notes(tags[:n], time_arr, midi_notes_cont)
+                # 构造 BIO 序列：峰值处 B，其余 I（voiced）/ O（unvoiced）
+                tags = []
+                peak_set = set(peaks.tolist())
+                for f in range(n):
+                    if f in peak_set:
+                        tags.append(1)   # B
+                    elif valid_mask[f]:
+                        tags.append(2)   # I
+                    else:
+                        tags.append(0)   # O
+
+                notes = _bio_to_notes(tags, time_arr, midi_notes_cont)
                 pred_midi = _notes_to_midi(notes, bpm=120.0)
 
                 gt_path = Path(dataloader.dataset.midi_dir) / f"{keys[i]}.mid"
@@ -282,7 +312,12 @@ def train(args: argparse.Namespace) -> None:
         if val_acc > best_acc:
             best_acc = val_acc
             ckpt_path = save_dir / "bilstm_crf.pt"
-            torch.save(model.state_dict(), str(ckpt_path))
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_acc": val_acc,
+            }, str(ckpt_path))
             logger.info("  => 保存最优模型 (acc=%.4f): %s", best_acc, ckpt_path)
 
     logger.info("训练完成。最优验证集 Note Accuracy: %.4f", best_acc)
