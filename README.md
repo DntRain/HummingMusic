@@ -56,6 +56,16 @@ python -m src.app
 
 浏览器访问 `http://localhost:7860`，录音或上传哼唱音频，选择风格，点击"生成"。
 
+## 可视化工具
+
+BiLSTM-CRF 量化器交互式可视化（钢琴卷帘 + 音频对比 + 模型得分）：
+
+```bash
+nohup /home/DontRain/Projects/YOLO11n_Furnas/python312/bin/streamlit run tools/visualizer.py --server.port 8501 --server.headless true > logs/visualizer.log 2>&1 &
+```
+
+浏览器访问 `http://localhost:8501`。
+
 ## 数据集准备
 
 本项目使用以下公开数据集，请自行下载并放入对应目录：

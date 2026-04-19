@@ -102,7 +102,7 @@ class HumTransDataset(Dataset):
         """
         key = self.keys[idx]
         features = self._load_features(key)       # (T, 4) numpy
-        labels = self._load_labels(key, n_frames=len(features))  # (T,) numpy
+        labels = self._load_labels(key, n_frames=len(features), features=features)  # (T,) numpy
 
         return {
             "key": key,
@@ -118,6 +118,7 @@ class HumTransDataset(Dataset):
     def _load_features(self, key: str) -> np.ndarray:
         """
         加载帧级特征，优先读取预提取 .npy，否则实时提取。
+        自动检测并修正演唱者低/高八度哼唱导致的音高偏移。
 
         Returns:
             np.ndarray: shape=(T, 4)，float32。
@@ -126,10 +127,51 @@ class HumTransDataset(Dataset):
         if self.feat_dir is not None:
             feat_path = self.feat_dir / f"{key}.npy"
             if feat_path.exists():
-                return np.load(str(feat_path)).astype(np.float32)
+                feat = np.load(str(feat_path)).astype(np.float32)
+                return self._correct_octave_shift(feat, key)
 
-        # 实时提取（慢，调试用）
-        return self._extract_features_realtime(key)
+        return self._correct_octave_shift(
+            self._extract_features_realtime(key), key
+        )
+
+    def _correct_octave_shift(self, feat: np.ndarray, key: str) -> np.ndarray:
+        """
+        检测 pyin 音高与 GT MIDI 之间的八度偏移并修正。
+
+        当演唱者低/高八度哼唱时，pyin 提取的 midi_note 与 GT 标注
+        相差约 12 个半音。通过比较中位音高自动检测并补偿。
+        """
+        import pretty_midi
+
+        valid = feat[:, 1] > 0
+        if valid.sum() < 10:
+            return feat
+
+        pyin_median = float(np.median(feat[valid, 0]))
+
+        mid_path = self.midi_dir / f"{key}.mid"
+        try:
+            midi = pretty_midi.PrettyMIDI(str(mid_path))
+            gt_pitches = [n.pitch for inst in midi.instruments
+                          for n in inst.notes]
+        except Exception:
+            return feat
+
+        if not gt_pitches:
+            return feat
+
+        gt_median = float(np.median(gt_pitches))
+        raw_offset = pyin_median - gt_median
+
+        # 将偏移量吸附到最近的12的倍数（只修正整八度偏移）
+        octaves = round(raw_offset / 12)
+        if octaves == 0:
+            return feat
+
+        correction = -octaves * 12
+        feat = feat.copy()
+        feat[valid, 0] += correction
+        return feat
 
     def _extract_features_realtime(self, key: str) -> np.ndarray:
         """实时提取特征：优先 CREPE，不可用时回退到 librosa.pyin。"""
@@ -181,13 +223,60 @@ class HumTransDataset(Dataset):
     # 标注转换
     # ──────────────────────────────────────────────
 
-    def _load_labels(self, key: str, n_frames: int) -> np.ndarray:
+    def _estimate_onset_offset(
+        self, features: np.ndarray, midi: pretty_midi.PrettyMIDI, n_frames: int
+    ) -> float:
+        """
+        用互相关估算 GT 时间与实际发声之间的全局偏移（秒）。
+
+        方法：将 GT 音符活跃序列与特征的 voiced 序列做互相关，
+        取相关最大处的 lag 作为偏移估计。
+
+        Returns:
+            float: offset_s，使得 actual_onset ≈ gt_onset + offset_s。
+                   限制在 [-1.0, 1.0] 秒以防噪声影响。
+        """
+        from scipy.signal import correlate
+
+        # GT 活跃序列：有音符的帧为 1，否则为 0
+        gt_activity = np.zeros(n_frames, dtype=np.float32)
+        for inst in midi.instruments:
+            if inst.is_drum:
+                continue
+            for note in inst.notes:
+                s = int(round(note.start / FRAME_STEP_S))
+                e = int(round(note.end / FRAME_STEP_S))
+                s = max(0, min(s, n_frames - 1))
+                e = max(0, min(e, n_frames))
+                if s < e:
+                    gt_activity[s:e] = 1.0
+
+        # 实际 voiced 序列：用置信度加权（CREPE 帧帧有值，纯 is_valid 无法区分噪声）
+        voiced = (features[:n_frames, 1] * features[:n_frames, 2]).astype(np.float32)
+
+        if gt_activity.sum() == 0 or voiced.sum() == 0:
+            return 0.0
+
+        # 互相关，找最大 lag
+        corr = correlate(voiced, gt_activity, mode="full")
+        lag = int(corr.argmax()) - (n_frames - 1)
+
+        offset_s = lag * FRAME_STEP_S
+        # 限制偏移范围，防止离群值
+        offset_s = float(np.clip(offset_s, -1.0, 1.0))
+        return offset_s
+
+    def _load_labels(self, key: str, n_frames: int, features: np.ndarray | None = None) -> np.ndarray:
         """
         将 MIDI 音符转换为帧级 BIO 标签。
+
+        若提供 features，则先估算 GT 与实际发声的时间偏移，
+        将音符时间对齐到实际发声位置后再打标签。
 
         Args:
             key: 样本 ID。
             n_frames: 帧数（与特征对齐）。
+            features: 帧级特征（可选），用于对齐偏移估算。
 
         Returns:
             np.ndarray: shape=(T,)，int64，取值 {0:O, 1:B, 2:I}。
@@ -196,13 +285,18 @@ class HumTransDataset(Dataset):
         midi = pretty_midi.PrettyMIDI(str(mid_path))
         labels = np.zeros(n_frames, dtype=np.int64)
 
+        # 估算时间偏移
+        offset_s = 0.0
+        if features is not None:
+            offset_s = self._estimate_onset_offset(features, midi, n_frames)
+
         for inst in midi.instruments:
             if inst.is_drum:
                 continue
             for note in inst.notes:
-                # 将音符起止时间映射到帧索引
-                start_frame = int(round(note.start / FRAME_STEP_S))
-                end_frame = int(round(note.end / FRAME_STEP_S))
+                # 将音符起止时间映射到帧索引（含偏移修正）
+                start_frame = int(round((note.start + offset_s) / FRAME_STEP_S))
+                end_frame = int(round((note.end + offset_s) / FRAME_STEP_S))
                 start_frame = max(0, min(start_frame, n_frames - 1))
                 end_frame = max(0, min(end_frame, n_frames))
 

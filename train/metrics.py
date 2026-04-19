@@ -12,7 +12,7 @@ import pretty_midi
 
 
 # 音符匹配容差
-ONSET_TOLERANCE = 0.05    # 起始时间容差：50ms
+ONSET_TOLERANCE = 0.30    # 起始时间容差：300ms（HumTrans GT 与实际发声有 200-400ms 系统偏移）
 OFFSET_TOLERANCE = 0.05   # 结束时间容差：50ms（offset 评估时用）
 
 

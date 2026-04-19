@@ -259,7 +259,7 @@ def train(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3
+        optimizer, mode="max", factor=0.5, patience=args.patience
     )
 
     save_dir = Path(args.save_dir)
@@ -346,6 +346,8 @@ def main() -> None:
         help="训练集样本上限（默认2000）",
     )
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=3,
+                        help="ReduceLROnPlateau patience（默认3）")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--hidden_size", type=int, default=128)
