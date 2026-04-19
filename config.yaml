@@ -23,6 +23,10 @@ quantizer:
   num_layers: 2
   dropout: 0.3
   use_crf: true
+  # baseline 量化器参数
+  confidence_threshold: 0.8    # 低于此值的帧视为静音
+  silence_threshold: 0.2       # 短于此时长(秒)的静音段做插值填充
+  default_velocity: 80         # baseline 输出音符的统一力度
 
 # 风格迁移
 style_transfer:
