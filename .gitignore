@@ -44,6 +44,19 @@ experiments/*
 !experiments/.gitkeep
 
 # ──────────────────────────────────────────────
+# 周报与大文件
+# ──────────────────────────────────────────────
+reports/
+logs/
+results/
+data/features/
+data/features_crepe/
+data/extract_crepe.log
+training_curve_v4.png
+activate_tf_env.sh
+*.zip
+
+# ──────────────────────────────────────────────
 # 音色库
 # ──────────────────────────────────────────────
 *.sf2

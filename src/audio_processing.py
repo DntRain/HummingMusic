@@ -16,6 +16,13 @@ import librosa
 import numpy as np
 import yaml
 
+try:
+    import crepe
+    CREPE_AVAILABLE = True
+except ImportError:
+    crepe = None
+    CREPE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # 加载配置
@@ -74,7 +81,8 @@ def _extract_f0(
             - frequency (np.ndarray): F0频率(Hz)，shape=(N,)
             - confidence (np.ndarray): 置信度[0,1]，shape=(N,)
     """
-    import crepe
+    if not CREPE_AVAILABLE:
+        raise RuntimeError("crepe 未安装，无法提取音高")
 
     step_size = _config["crepe"]["step_size"]
     model_capacity = _config["crepe"]["model_capacity"]

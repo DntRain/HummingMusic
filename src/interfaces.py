@@ -7,7 +7,6 @@ interfaces.py - 模块间接口定义
 
 from typing import Literal, Protocol
 
-import numpy as np
 import pretty_midi
 
 

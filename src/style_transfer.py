@@ -58,7 +58,10 @@ def midi_to_piano_roll(
     """
     if fs is None:
         # 根据 tempo 和分辨率计算帧率
-        tempo = midi.estimate_tempo()
+        try:
+            tempo = midi.estimate_tempo()
+        except ValueError:
+            tempo = 120.0
         resolution = _config["style_transfer"]["resolution"]
         fs = int(tempo * resolution / 60.0)
         fs = max(fs, 1)
@@ -339,7 +342,7 @@ def _load_style_vectors() -> dict[str, np.ndarray]:
     Returns:
         dict[str, np.ndarray]: 风格名 → 参考向量映射。
     """
-    global _style_vectors
+    global _style_vectors  # noqa: F824
     if _style_vectors:
         return _style_vectors
 
@@ -380,14 +383,26 @@ def _infer_chords_and_add_accompaniment(
         logger.warning("music21 不可用，跳过和弦推断")
         return midi
 
-    if not midi.instruments or not midi.instruments[0].notes:
+    if not midi.instruments or all(
+        len(inst.notes) == 0 for inst in midi.instruments
+    ):
         return midi
+
+    # 安全估计 tempo
+    total_notes = sum(len(inst.notes) for inst in midi.instruments)
+    if total_notes < 2:
+        tempo = 120.0
+    else:
+        try:
+            tempo = midi.estimate_tempo()
+        except ValueError:
+            tempo = 120.0
 
     # 将旋律转为 music21 stream 进行分析
     melody_stream = music21.stream.Stream()
     for note in midi.instruments[0].notes:
         m21_note = music21.note.Note(note.pitch)
-        m21_note.quarterLength = (note.end - note.start) * midi.estimate_tempo() / 60.0
+        m21_note.quarterLength = (note.end - note.start) * tempo / 60.0
         melody_stream.append(m21_note)
 
     # 调性分析
@@ -411,7 +426,7 @@ def _infer_chords_and_add_accompaniment(
     )
 
     total_duration = midi.get_end_time()
-    beat_duration = 60.0 / max(midi.estimate_tempo(), 1.0)
+    beat_duration = 60.0 / max(tempo, 1.0)
     beats_per_chord = 4  # 每个和弦持续4拍
 
     t = 0.0
@@ -459,8 +474,6 @@ def _generate_chord_progression(
     Returns:
         list[list[int]]: 和弦列表，每个和弦为MIDI音高列表。
     """
-    import music21
-
     tonic_pitch = key.tonic.midi
 
     if key.mode == "minor":
@@ -626,7 +639,10 @@ def transfer_style(
 
         # 转回MIDI
         recon_roll = (recon.squeeze(0).numpy() * 127).clip(0, 127)
-        bpm = midi.estimate_tempo()
+        try:
+            bpm = midi.estimate_tempo()
+        except ValueError:
+            bpm = 120.0
         result = piano_roll_to_midi(recon_roll, bpm)
 
         # 添加伴奏

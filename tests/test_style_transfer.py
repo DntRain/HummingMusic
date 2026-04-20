@@ -4,10 +4,17 @@ test_style_transfer.py - 风格迁移模块单元测试
 覆盖：正常输入、边界输入（空MIDI、单音符MIDI）、异常输入（无效风格标签）
 """
 
+import sys
+from unittest.mock import MagicMock
+
 import numpy as np
 import pretty_midi
 import pytest
-import torch
+
+# 判断 torch 是否真实可用（非 mock）
+TORCH_AVAILABLE = (
+    "torch" in sys.modules and not isinstance(sys.modules["torch"], MagicMock)
+)
 
 
 def _create_test_midi(n_notes: int = 4, bpm: float = 120.0) -> pretty_midi.PrettyMIDI:
@@ -63,11 +70,14 @@ class TestPianoRollConversion:
         assert total_notes == 0
 
 
+@pytest.mark.skipif(not TORCH_AVAILABLE, reason="torch 未安装，CI 中跳过")
 class TestVQVAE:
-    """VQ-VAE 模型测试。"""
+    """VQ-VAE 模型测试（需要真实 torch）。"""
 
     def test_vector_quantizer(self):
         """向量量化器应返回正确形状。"""
+        import torch
+
         from src.style_transfer import VectorQuantizer
 
         vq = VectorQuantizer(codebook_size=64, embedding_dim=32)
@@ -79,12 +89,14 @@ class TestVQVAE:
 
     def test_encoder_decoder(self):
         """编码器和解码器维度应匹配。"""
+        import torch
+
         from src.style_transfer import Decoder, Encoder
 
         enc = Encoder(in_channels=128, channels=[64, 128, 256], embedding_dim=64)
         dec = Decoder(out_channels=128, channels=[256, 128, 64], embedding_dim=64)
 
-        x = torch.randn(1, 128, 64)  # (batch, pitches, time)
+        x = torch.randn(1, 128, 64)
         z = enc(x)
         recon = dec(z)
         assert recon.shape[0] == 1
@@ -92,6 +104,8 @@ class TestVQVAE:
 
     def test_style_vqvae_forward(self):
         """完整 VQ-VAE 前向传播应返回正确形状。"""
+        import torch
+
         from src.style_transfer import StyleVQVAE
 
         model = StyleVQVAE(

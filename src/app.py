@@ -7,7 +7,7 @@ app.py - Gradio 主入口
 - 完整 pipeline 触发
 - 结果展示（音频播放、Piano Roll、MIDI下载）
 """
-
+# test
 import logging
 import tempfile
 from pathlib import Path
@@ -15,9 +15,10 @@ from pathlib import Path
 import gradio as gr
 import matplotlib
 import matplotlib.pyplot as plt
-import numpy as np
 import pretty_midi
 import yaml
+
+from src.interfaces import extract_pitch, quantize_humming, render_audio, transfer_style
 
 # 使用非交互后端
 matplotlib.use("Agg")
@@ -33,13 +34,6 @@ logging.basicConfig(
     format=_config["logging"]["format"],
 )
 logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────
-# 通过 interfaces 调用各模块（严格遵守接口约定）
-# ──────────────────────────────────────────────
-
-from src.interfaces import extract_pitch, quantize_humming, render_audio, transfer_style
 
 
 # ──────────────────────────────────────────────

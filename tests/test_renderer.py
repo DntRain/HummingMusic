@@ -4,11 +4,10 @@ test_renderer.py - 渲染模块单元测试
 覆盖：正常输入、边界输入（空MIDI）、fallback 渲染
 """
 
+import tempfile
 from pathlib import Path
 
-import numpy as np
 import pretty_midi
-import pytest
 
 
 def _create_test_midi(n_notes: int = 4) -> pretty_midi.PrettyMIDI:
@@ -41,11 +40,6 @@ class TestRenderAudio:
         assert Path(wav_path).exists()
         assert Path(wav_path).stat().st_size > 0
 
-        # 清理
-        Path(wav_path).parent.rmdir() if not any(
-            Path(wav_path).parent.iterdir()
-        ) else None
-
     def test_output_in_tmp_dir(self):
         """输出应在 tmp/ 目录下的 UUID 子目录中。"""
         from src.renderer import render_audio
@@ -54,10 +48,8 @@ class TestRenderAudio:
         wav_path = render_audio(midi)
 
         assert "tmp" in wav_path
-        # UUID 子目录应存在
         parent = Path(wav_path).parent
         assert parent.exists()
-        # 应同时生成 MIDI 文件
         midi_path = parent / "output.mid"
         assert midi_path.exists()
 
@@ -91,7 +83,6 @@ class TestFallbackRender:
         from src.renderer import _render_with_pretty_midi
 
         midi = _create_test_midi()
-        import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
 
@@ -116,6 +107,5 @@ class TestTmpDirManagement:
         assert dir1.exists()
         assert dir2.exists()
 
-        # 清理
         dir1.rmdir()
         dir2.rmdir()
