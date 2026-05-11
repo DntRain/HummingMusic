@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import io
 import json
+import time
+import tempfile
+import os
 import numpy as np
 import pretty_midi
 import soundfile as sf
@@ -31,7 +34,7 @@ from train.metrics import compute_note_metrics
 # ──────────────────────────────────────────────
 DATA_ROOT   = "/run/media/DontRain/DATA_NANO/HumTrans"
 FEAT_DIR    = "data/features_crepe"
-CKPT_PATH   = "models/quantizer_v4/bilstm_crf.pt"
+CKPT_PATH   = "models/quantizer_v5/bilstm_crf.pt"
 SPLIT_JSON  = f"{DATA_ROOT}/train_valid_test_keys.json"
 WAV_DIR     = f"{DATA_ROOT}/all_wav/wav_data_sync_with_midi"
 MIDI_DIR    = f"{DATA_ROOT}/midi_data"
@@ -56,13 +59,14 @@ def load_model():
 
 
 @st.cache_resource
-def load_dataset(split: str):
+def load_dataset(split: str, correct_octave: bool = True):
     import logging
     logging.disable(logging.WARNING)
     ds = HumTransDataset(
         split_json=SPLIT_JSON, split=split,
         wav_dir=WAV_DIR, midi_dir=MIDI_DIR,
         feat_dir=FEAT_DIR,
+        correct_octave=correct_octave,
     )
     logging.disable(logging.NOTSET)
     return ds
@@ -277,10 +281,57 @@ st.set_page_config(
 )
 st.title("🎵 BiLSTM-CRF 量化器可视化")
 
+# ──────────────────────────────────────────────
+# 错误检测工具函数
+# ──────────────────────────────────────────────
+ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+MIN_DURATION_SEC   = 1.0    # 最短有效音频时长
+INFERENCE_TIMEOUT  = 10.0   # 推理超时阈值（秒）
+
+
+def validate_uploaded_audio(uploaded_file) -> tuple[bool, str, np.ndarray | None, int | None]:
+    """
+    返回 (ok, error_msg, audio_data, sr)
+    错误类型：格式错误 / 音频过短
+    """
+    if uploaded_file is None:
+        return False, "", None, None
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix not in ALLOWED_AUDIO_EXTS:
+        return False, f"格式错误：不支持 {suffix} 格式，请上传 {' / '.join(sorted(ALLOWED_AUDIO_EXTS))} 文件。", None, None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(uploaded_file.getbuffer())
+            tmp = f.name
+        audio, sr = sf.read(tmp)
+        os.unlink(tmp)
+    except Exception as e:
+        return False, f"格式错误：文件无法解析（{e}）", None, None
+
+    duration = len(audio) / sr
+    if duration < MIN_DURATION_SEC:
+        return False, f"音频过短：时长 {duration:.2f}s，最短需 {MIN_DURATION_SEC}s。请上传更长的录音。", None, None
+
+    return True, "", audio, sr
+
+
+def run_inference_with_timeout(item, model, device, peak_distance, peak_height_sigma):
+    """带超时检测的推理包装，超时返回 None。"""
+    t0 = time.time()
+    result = run_inference(item, model, device, peak_distance, peak_height_sigma)
+    elapsed = time.time() - t0
+    if elapsed > INFERENCE_TIMEOUT:
+        return None, elapsed
+    return result, elapsed
+
+
 # ── 侧边栏 ──
 with st.sidebar:
     st.header("设置")
     split = st.selectbox("数据集分片", ["TEST", "VALID", "TRAIN"], index=0)
+    correct_octave = st.checkbox("八度偏移自动修正", value=True)
     peak_distance = st.slider("峰值最小间距（帧，1帧=10ms）", 5, 50, 20)
     peak_height_sigma = st.slider("峰值高度阈值 (均值 + σ * std)", 0.0, 3.0, 0.5, 0.1)
     st.markdown("---")
@@ -293,14 +344,62 @@ with st.sidebar:
         "Synth Lead",
     ], index=0)
     st.markdown("---")
-    st.caption("模型: BiLSTM-CRF v4\nCREPE 特征 + GT 对齐\n全量 13080 训练样本")
+    st.subheader("上传自定义音频")
+    uploaded_file = st.file_uploader("上传哼唱音频", type=["wav","mp3","flac","ogg","m4a","txt","bin"])
+    st.markdown("---")
+    st.caption("模型: BiLSTM-CRF v5\nCREPE 特征 + GT 对齐\n全量 13080 训练样本")
+
+# ── 错误演示区（顶部） ──
+st.markdown("## 错误提示演示")
+demo_col1, demo_col2, demo_col3 = st.columns(3)
+with demo_col1:
+    if st.button("触发：格式错误"):
+        st.session_state["demo_error"] = "format"
+with demo_col2:
+    if st.button("触发：音频过短"):
+        st.session_state["demo_error"] = "short"
+with demo_col3:
+    if st.button("触发：推理超时"):
+        st.session_state["demo_error"] = "timeout"
+if st.button("清除错误演示", type="secondary"):
+    st.session_state.pop("demo_error", None)
+
+demo_error = st.session_state.get("demo_error")
+if demo_error == "format":
+    st.error("❌ 格式错误：不支持 .mp4 格式，请上传 .flac / .m4a / .mp3 / .ogg / .wav 文件。")
+    st.info("💡 支持的格式：WAV、MP3、FLAC、OGG、M4A")
+elif demo_error == "short":
+    st.warning("⚠️ 音频过短：时长 0.43s，最短需 1.0s。请上传更长的录音。")
+    st.info("💡 建议：录制至少 2 秒以上的哼唱片段，以获得准确的音符量化结果。")
+elif demo_error == "timeout":
+    st.error("⏱️ 推理超时：模型处理时间超过 10s 限制。")
+    st.info("💡 建议：缩短音频时长（推荐 10–30s），或降低 CREPE 精度到 `small` 以加速推理。")
+
+st.markdown("---")
+
+# ── 上传音频实时验证 ──
+if uploaded_file is not None:
+    ok, err_msg, audio_data, sr = validate_uploaded_audio(uploaded_file)
+    if not ok:
+        if "格式" in err_msg:
+            st.error(f"❌ {err_msg}")
+            st.info("💡 支持的格式：WAV、MP3、FLAC、OGG、M4A")
+        else:
+            st.warning(f"⚠️ {err_msg}")
+            st.info("💡 建议：录制至少 2 秒以上的哼唱片段，以获得准确的音符量化结果。")
+        st.stop()
+    else:
+        st.success(f"✅ 已上传：{uploaded_file.name}（{len(audio_data)/sr:.1f}s，{sr}Hz）")
+        st.audio(uploaded_file)
+        st.info("ℹ️ 上传音频的 CREPE 特征提取与量化推理功能即将支持，当前请使用数据集样本。")
+        st.stop()
 
 # ── 加载资源 ──
 with st.spinner("加载模型..."):
     model, device = load_model()
 
 with st.spinner(f"加载 {split} 数据集..."):
-    ds = load_dataset(split)
+    ds = load_dataset(split, correct_octave=correct_octave)
 
 st.success(f"已加载 {len(ds)} 条样本")
 
@@ -328,7 +427,12 @@ st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {
 
 # ── 推理 ──
 with st.spinner("模型推理..."):
-    result = run_inference(item, model, device, peak_distance, peak_height_sigma)
+    result, elapsed = run_inference_with_timeout(item, model, device, peak_distance, peak_height_sigma)
+
+if result is None:
+    st.error(f"⏱️ 推理超时：模型处理时间 {elapsed:.1f}s 超过 {INFERENCE_TIMEOUT}s 限制。")
+    st.info("💡 建议：缩短音频时长（推荐 10–30s），或降低 CREPE 精度到 `small` 以加速推理。")
+    st.stop()
 
 gt_midi_path = Path(MIDI_DIR) / f"{key}.mid"
 gt_midi = pretty_midi.PrettyMIDI(str(gt_midi_path))
@@ -410,3 +514,114 @@ with col_pred:
     st.markdown("**预测音符**")
     pred_rows = get_note_rows(result["pred_midi"])
     st.dataframe(pd.DataFrame(pred_rows), use_container_width=True, height=400)
+
+# ── 风格迁移对比 ──
+st.markdown("---")
+st.subheader("风格迁移对比")
+
+@st.cache_resource
+def load_vqvae():
+    import yaml
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)["style_transfer"]
+    from src.style_transfer import StyleVQVAE, Decoder
+    vq = StyleVQVAE(
+        in_channels=cfg["in_channels"],
+        codebook_size=cfg["codebook_size"],
+        embedding_dim=cfg["embedding_dim"],
+    )
+    state = torch.load(cfg["model_path"], map_location="cpu", weights_only=False)
+    vq.load_state_dict(state.get("model_state_dict", state))
+    vq.eval()
+    # 加载各风格独立解码器
+    decoders = {}
+    vec_dir = Path(cfg["style_vectors_dir"])
+    for s in ["pop", "jazz", "classical", "folk"]:
+        dec_path = vec_dir / f"decoder_{s}.pt"
+        if dec_path.exists():
+            dec = Decoder(out_channels=cfg["in_channels"], embedding_dim=64)
+            dec.load_state_dict(torch.load(str(dec_path), map_location="cpu", weights_only=False))
+            dec.eval()
+            decoders[s] = dec
+    return vq, decoders, cfg
+
+@st.cache_data(max_entries=20)
+def run_style_transfer(midi_bytes: bytes, style: str) -> bytes:
+    import numpy as np, tempfile, os
+    vq, decoders, cfg = load_vqvae()
+    if style not in decoders:
+        return b""
+    pitch_low  = cfg["pitch_low"]
+    pitch_high = cfg["pitch_high"]
+    frame_rate = cfg["frame_rate"]
+
+    with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
+        f.write(midi_bytes); tmp = f.name
+    try:
+        pm = pretty_midi.PrettyMIDI(tmp)
+    finally:
+        os.unlink(tmp)
+
+    roll128 = pm.get_piano_roll(fs=frame_rate)
+    roll48  = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)
+    T = roll48.shape[1]
+    if T < 32:
+        roll48 = np.pad(roll48, ((0,0),(0, 32 - T)))
+        T = 32
+    pad = (8 - T % 8) % 8
+    if pad:
+        roll48 = np.pad(roll48, ((0,0),(0,pad)))
+
+    x = torch.from_numpy(roll48).float().unsqueeze(0)
+    with torch.no_grad():
+        z_q, _ = vq.encode(x)
+        recon = decoders[style](z_q)   # 用风格专属解码器
+
+    recon48 = (recon.squeeze(0).numpy()[:, :T] * 127).clip(0, 127)
+    recon128 = np.zeros((128, T), dtype=np.float32)
+    recon128[pitch_low:pitch_high] = recon48
+
+    try:
+        bpm = pm.estimate_tempo()
+    except ValueError:
+        bpm = 120.0
+    frame_dur = 1.0 / frame_rate
+    from src.style_transfer import STYLE_PROGRAMS
+    progs = STYLE_PROGRAMS.get(style, STYLE_PROGRAMS["pop"])
+    out = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    inst = pretty_midi.Instrument(program=progs["melody"], name="melody")
+    for pitch in range(128):
+        active = recon128[pitch] > 0
+        if not np.any(active):
+            continue
+        changes = np.diff(active.astype(int))
+        starts = np.concatenate([[0], np.where(changes==1)[0]+1]) if active[0] else np.where(changes==1)[0]+1
+        ends   = np.concatenate([np.where(changes==-1)[0]+1, [T]]) if active[-1] else np.where(changes==-1)[0]+1
+        for s, e in zip(starts, ends):
+            vel = max(1, min(127, int(np.mean(recon128[pitch, s:e]))))
+            inst.notes.append(pretty_midi.Note(vel, pitch, s*frame_dur, e*frame_dur))
+    out.instruments.append(inst)
+    return midi_to_bytes(out)
+
+with st.spinner("加载 VQ-VAE..."):
+    _vq_ok = load_vqvae()
+
+pred_midi_bytes = midi_to_bytes(result["pred_midi"])
+
+st.markdown("**迁移前（量化旋律）**")
+with st.spinner("合成原始旋律..."):
+    orig_wav = synthesize_midi(pred_midi_bytes, instrument_name)
+st.audio(orig_wav, format="audio/wav")
+
+st.markdown("**迁移后（四种风格）**")
+st_cols = st.columns(4)
+for col, style in zip(st_cols, ["pop", "jazz", "classical", "folk"]):
+    with col:
+        st.markdown(f"**{style.capitalize()}**")
+        with st.spinner(f"{style}..."):
+            styled_bytes = run_style_transfer(pred_midi_bytes, style)
+        if styled_bytes:
+            styled_wav = synthesize_midi(styled_bytes, instrument_name)
+            st.audio(styled_wav, format="audio/wav")
+        else:
+            st.warning("向量缺失")
