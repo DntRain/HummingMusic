@@ -623,13 +623,13 @@ def transfer_style(
         return _fallback_transfer(midi, style)
 
     try:
-        pitch_low  = _config["style_transfer"]["pitch_low"]
+        pitch_low = _config["style_transfer"]["pitch_low"]
         pitch_high = _config["style_transfer"]["pitch_high"]
         frame_rate = _config["style_transfer"]["frame_rate"]
 
         # 提取 48 维 piano roll（C2–C6），二值化
-        roll128 = midi_to_piano_roll(midi, fs=frame_rate)          # (128, T)
-        roll48  = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)  # (48, T)
+        roll128 = midi_to_piano_roll(midi, fs=frame_rate)  # (128, T)
+        roll48 = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)  # (48, T)
 
         # T 需为 8 的倍数（3 层 stride-2）
         T = roll48.shape[1]
