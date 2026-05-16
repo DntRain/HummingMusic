@@ -7,6 +7,10 @@ renderer.py - 渲染模块
 - 临时文件管理（UUID子目录）
 """
 
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 import logging
 import uuid
 from pathlib import Path

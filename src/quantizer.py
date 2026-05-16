@@ -8,14 +8,39 @@ quantizer.py - 容错量化模块
 - Fallback：模型未加载时使用直接四舍五入方法
 """
 
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 import logging
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pretty_midi
-import torch
-import torch.nn as nn
 import yaml
+
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = not isinstance(torch, MagicMock)
+except ImportError:
+    TORCH_AVAILABLE = False
+
+    class _UnavailableTorch:
+        Tensor = object
+
+        def __getattr__(self, name):
+            raise RuntimeError("torch 未安装，无法使用模型推理")
+
+    class _UnavailableNN:
+        Module = object
+
+        def __getattr__(self, name):
+            raise RuntimeError("torch 未安装，无法初始化模型层")
+
+    torch = _UnavailableTorch()
+    nn = _UnavailableNN()
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +672,7 @@ class RoundingBaselineQuantizer:
 # ──────────────────────────────────────────────
 
 _model: BiLSTMCRF | None = None
+_model_load_attempted = False
 
 
 def _load_model() -> BiLSTMCRF | None:
@@ -656,9 +682,15 @@ def _load_model() -> BiLSTMCRF | None:
     Returns:
         BiLSTMCRF | None: 加载成功返回模型实例，失败返回 None。
     """
-    global _model
+    global _model, _model_load_attempted
     if _model is not None:
         return _model
+    if _model_load_attempted:
+        return None
+    _model_load_attempted = True
+    if not TORCH_AVAILABLE:
+        logger.warning("torch 不可用，将使用 fallback")
+        return None
 
     model_path = Path(_config["quantizer"]["model_path"])
     if not model_path.exists():

@@ -19,7 +19,7 @@ import yaml
 try:
     import crepe
     CREPE_AVAILABLE = True
-except ImportError:
+except Exception:
     crepe = None
     CREPE_AVAILABLE = False
 
@@ -82,21 +82,82 @@ def _extract_f0(
             - confidence (np.ndarray): 置信度[0,1]，shape=(N,)
     """
     if not CREPE_AVAILABLE:
-        raise RuntimeError("crepe 未安装，无法提取音高")
+        logger.warning("CREPE/TensorFlow 不可用，改用 librosa.pyin fallback")
+        return _extract_f0_with_librosa(audio, sr)
 
     step_size = _config["crepe"]["step_size"]
     model_capacity = _config["crepe"]["model_capacity"]
     viterbi = _config["crepe"]["viterbi"]
 
-    time, frequency, confidence, _ = crepe.predict(
-        audio,
-        sr,
-        model_capacity=model_capacity,
-        viterbi=viterbi,
-        step_size=step_size,
-    )
+    try:
+        time, frequency, confidence, _ = crepe.predict(
+            audio,
+            sr,
+            model_capacity=model_capacity,
+            viterbi=viterbi,
+            step_size=step_size,
+        )
+        logger.info("CREPE 提取完成: %d 帧", len(time))
+        return time, frequency, confidence
+    except Exception as e:
+        logger.warning("CREPE 提取失败，改用 librosa.pyin fallback: %s", e)
+        return _extract_f0_with_librosa(audio, sr)
 
-    logger.info("CREPE 提取完成: %d 帧", len(time))
+
+def _extract_f0_with_librosa(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    使用 librosa 的单声部音高估计作为 CREPE/TensorFlow 不可用时的 fallback。
+
+    该路径质量弱于 CREPE，但足以保证本地 Web demo 和端到端流程可运行。
+    """
+    step_size = _config["crepe"]["step_size"]
+    hop_length = max(int(sr * step_size / 1000), 1)
+    frame_length = min(2048, max(256, 2 ** int(np.ceil(np.log2(hop_length * 4)))))
+    fmin = librosa.note_to_hz("C2")
+    fmax = librosa.note_to_hz("C7")
+
+    try:
+        frequency, voiced_flag, voiced_prob = librosa.pyin(
+            audio,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+        confidence = np.where(voiced_flag, 0.95, 0.0).astype(np.float32)
+        confidence = np.maximum(confidence, np.nan_to_num(voiced_prob, nan=0.0))
+        frequency = frequency.astype(float)
+        frequency[~voiced_flag] = np.nan
+    except Exception as e:
+        logger.warning("librosa.pyin 失败，改用 librosa.yin: %s", e)
+        frequency = librosa.yin(
+            audio,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        ).astype(float)
+        rms = librosa.feature.rms(
+            y=audio,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )[0]
+        if np.max(rms) > 0:
+            confidence = (rms / np.max(rms)).astype(np.float32)
+        else:
+            confidence = np.zeros_like(frequency, dtype=np.float32)
+        frequency[confidence < 0.1] = np.nan
+
+    time = librosa.frames_to_time(
+        np.arange(len(frequency)),
+        sr=sr,
+        hop_length=hop_length,
+    )
+    logger.info("librosa F0 提取完成: %d 帧", len(time))
     return time, frequency, confidence
 
 
@@ -192,6 +253,9 @@ def _estimate_bpm(audio: np.ndarray, sr: int) -> float:
     tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
     # librosa >= 0.10 返回数组
     bpm = float(np.atleast_1d(tempo)[0])
+    if not np.isfinite(bpm) or bpm <= 0:
+        logger.warning("BPM 估计无效: %.1f，使用默认 120.0", bpm)
+        bpm = 120.0
     logger.info("BPM 估计: %.1f", bpm)
     return bpm
 

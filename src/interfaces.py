@@ -5,6 +5,10 @@ interfaces.py - 模块间接口定义
 所有模块间通信必须严格通过此处定义的接口进行。
 """
 
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 from typing import Literal, Protocol
 
 import pretty_midi

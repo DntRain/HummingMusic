@@ -183,3 +183,27 @@ class TestTransferStyle:
         midi = _create_test_midi(n_notes=1)
         result = transfer_style(midi, "jazz")
         assert isinstance(result, pretty_midi.PrettyMIDI)
+
+    def test_transfer_does_not_mutate_input(self):
+        """多风格连续调用不应向原始 MIDI 累积伴奏轨。"""
+        from src.style_transfer import transfer_style
+
+        midi = _create_test_midi()
+        original_tracks = len(midi.instruments)
+        original_program = midi.instruments[0].program
+
+        transfer_style(midi, "pop")
+        transfer_style(midi, "jazz")
+
+        assert len(midi.instruments) == original_tracks
+        assert midi.instruments[0].program == original_program
+
+    def test_fast_key_estimation(self):
+        """C 大调测试旋律应能用轻量路径估计出有效调性对象。"""
+        from src.style_transfer import _estimate_key_fast
+
+        midi = _create_test_midi()
+        key = _estimate_key_fast(midi)
+
+        assert 0 <= key.tonic.midi <= 11
+        assert key.mode in {"major", "minor"}

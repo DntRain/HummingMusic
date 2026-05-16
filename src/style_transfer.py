@@ -9,16 +9,44 @@ style_transfer.py - 风格迁移模块
 - Fallback：模型未加载时直接返回原始MIDI
 """
 
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 import logging
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from unittest.mock import MagicMock
 
 import numpy as np
 import pretty_midi
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import yaml
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = not isinstance(torch, MagicMock)
+except ImportError:
+    TORCH_AVAILABLE = False
+    F = None
+
+    class _UnavailableTorch:
+        Tensor = object
+
+        def __getattr__(self, name):
+            raise RuntimeError("torch 未安装，无法使用 VQ-VAE 推理")
+
+    class _UnavailableNN:
+        Module = object
+
+        def __getattr__(self, name):
+            raise RuntimeError("torch 未安装，无法初始化模型层")
+
+    torch = _UnavailableTorch()
+    nn = _UnavailableNN()
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +65,26 @@ STYLE_PROGRAMS = {
     "classical": {"melody": 40, "chords": 48, "bass": 42},  # Violin, Strings, Cello
     "folk": {"melody": 25, "chords": 24, "bass": 21},    # Guitar, Nylon Guitar, Accordion
 }
+
+_MAJOR_PROFILE = np.array(
+    [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+    dtype=np.float32,
+)
+_MINOR_PROFILE = np.array(
+    [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+    dtype=np.float32,
+)
+
+
+@dataclass(frozen=True)
+class _SimpleTonic:
+    midi: int
+
+
+@dataclass(frozen=True)
+class _SimpleKey:
+    tonic: _SimpleTonic
+    mode: str
 
 
 # ──────────────────────────────────────────────
@@ -331,6 +379,7 @@ class StyleVQVAE(nn.Module):
 # ──────────────────────────────────────────────
 
 _style_vectors: dict[str, np.ndarray] = {}
+_style_vectors_loaded = False
 
 
 def _load_style_vectors() -> dict[str, np.ndarray]:
@@ -342,9 +391,10 @@ def _load_style_vectors() -> dict[str, np.ndarray]:
     Returns:
         dict[str, np.ndarray]: 风格名 → 参考向量映射。
     """
-    global _style_vectors  # noqa: F824
-    if _style_vectors:
+    global _style_vectors, _style_vectors_loaded  # noqa: F824
+    if _style_vectors_loaded:
         return _style_vectors
+    _style_vectors_loaded = True
 
     style_dir = Path(_config["style_transfer"]["style_vectors_dir"])
     for style in VALID_STYLES:
@@ -377,11 +427,7 @@ def _infer_chords_and_add_accompaniment(
     Returns:
         pretty_midi.PrettyMIDI: 添加了伴奏轨道的MIDI。
     """
-    try:
-        import music21
-    except ImportError:
-        logger.warning("music21 不可用，跳过和弦推断")
-        return midi
+    midi = deepcopy(midi)
 
     if not midi.instruments or all(
         len(inst.notes) == 0 for inst in midi.instruments
@@ -398,15 +444,11 @@ def _infer_chords_and_add_accompaniment(
         except ValueError:
             tempo = 120.0
 
-    # 将旋律转为 music21 stream 进行分析
-    melody_stream = music21.stream.Stream()
-    for note in midi.instruments[0].notes:
-        m21_note = music21.note.Note(note.pitch)
-        m21_note.quarterLength = (note.end - note.start) * tempo / 60.0
-        melody_stream.append(m21_note)
-
-    # 调性分析
-    key = melody_stream.analyze("key")
+    # 调性分析。默认使用轻量 pitch-class 估计；需要复现实验时可在配置中关闭。
+    if _config["style_transfer"].get("fast_chord_inference", True):
+        key = _estimate_key_fast(midi)
+    else:
+        key = _estimate_key_music21(midi, tempo)
     logger.info("检测到调性: %s", key)
 
     # 根据调性生成简单和弦进行
@@ -459,6 +501,57 @@ def _infer_chords_and_add_accompaniment(
     midi.instruments.append(bass_track)
 
     return midi
+
+
+def _estimate_key_music21(midi: pretty_midi.PrettyMIDI, tempo: float):
+    """使用 music21 的完整调性分析，作为可复现实验基线。"""
+    try:
+        import music21
+    except ImportError:
+        logger.warning("music21 不可用，使用轻量调性估计")
+        return _estimate_key_fast(midi)
+
+    melody_stream = music21.stream.Stream()
+    for note in midi.instruments[0].notes:
+        m21_note = music21.note.Note(note.pitch)
+        m21_note.quarterLength = (note.end - note.start) * tempo / 60.0
+        melody_stream.append(m21_note)
+    return melody_stream.analyze("key")
+
+
+def _estimate_key_fast(midi: pretty_midi.PrettyMIDI) -> _SimpleKey:
+    """
+    基于音高类别直方图的轻量调性估计。
+
+    该方法避免在端到端 fallback 路径中调用 music21 的完整分析器。
+    对本系统的伴奏生成只需要主音和大小调，精度足够且耗时稳定。
+    """
+    pitch_classes = np.zeros(12, dtype=np.float32)
+    for note in midi.instruments[0].notes:
+        duration = max(note.end - note.start, 0.0)
+        pitch_classes[note.pitch % 12] += max(duration, 0.01) * note.velocity
+
+    if not np.any(pitch_classes):
+        return _SimpleKey(_SimpleTonic(0), "major")
+
+    pitch_classes = pitch_classes / np.linalg.norm(pitch_classes)
+    best_score = -np.inf
+    best_root = 0
+    best_mode = "major"
+
+    for root in range(12):
+        major_score = float(np.dot(pitch_classes, np.roll(_MAJOR_PROFILE, root)))
+        minor_score = float(np.dot(pitch_classes, np.roll(_MINOR_PROFILE, root)))
+        if major_score > best_score:
+            best_score = major_score
+            best_root = root
+            best_mode = "major"
+        if minor_score > best_score:
+            best_score = minor_score
+            best_root = root
+            best_mode = "minor"
+
+    return _SimpleKey(_SimpleTonic(best_root), best_mode)
 
 
 def _generate_chord_progression(
@@ -527,6 +620,7 @@ def _generate_chord_progression(
 # ──────────────────────────────────────────────
 
 _vqvae_model: StyleVQVAE | None = None
+_vqvae_model_load_attempted = False
 
 
 def _load_vqvae_model() -> StyleVQVAE | None:
@@ -536,9 +630,15 @@ def _load_vqvae_model() -> StyleVQVAE | None:
     Returns:
         StyleVQVAE | None: 模型实例或 None。
     """
-    global _vqvae_model
+    global _vqvae_model, _vqvae_model_load_attempted
     if _vqvae_model is not None:
         return _vqvae_model
+    if _vqvae_model_load_attempted:
+        return None
+    _vqvae_model_load_attempted = True
+    if not TORCH_AVAILABLE:
+        logger.warning("torch 不可用，将使用 fallback")
+        return None
 
     model_path = Path(_config["style_transfer"]["model_path"])
     if not model_path.exists():

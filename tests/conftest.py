@@ -5,6 +5,10 @@ conftest.py - pytest 全局配置
 本地有完整安装时使用真实模块。
 """
 
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 import sys
 from unittest.mock import MagicMock
 

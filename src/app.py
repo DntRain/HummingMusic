@@ -8,6 +8,10 @@ app.py - Gradio 主入口
 - 结果展示（音频播放、Piano Roll、MIDI下载）
 """
 # test
+from src.windows_compat import ignore_missing_optional_fluidsynth_path
+
+ignore_missing_optional_fluidsynth_path()
+
 import logging
 import tempfile
 from pathlib import Path
