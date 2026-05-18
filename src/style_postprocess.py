@@ -22,17 +22,17 @@ from src.style_transfer import STYLE_PROGRAMS
 
 
 CHORD_PROGRESSIONS = {
-    "pop":       [0, 7, 9, 5],   # I  - V  - vi - IV  (C G Am F)
-    "jazz":      [0, 9, 2, 7],   # Imaj7 - vi7 - ii7 - V7
-    "classical": [0, 5, 7, 0],   # I  - IV - V  - I
-    "folk":      [0, 7, 0, 5],   # I  - V  - I  - IV
+    "pop": [0, 7, 9, 5],          # I  - V  - vi - IV  (C G Am F)
+    "jazz": [0, 9, 2, 7],         # Imaj7 - vi7 - ii7 - V7
+    "classical": [0, 5, 7, 0],    # I  - IV - V  - I
+    "folk": [0, 7, 0, 5],         # I  - V  - I  - IV
 }
 
 CHORD_TYPE = {
-    "pop":       (0, 4, 7),        # 大三
-    "jazz":      (0, 4, 7, 10),    # 属七 / 小七（统一七和弦感）
+    "pop": (0, 4, 7),             # 大三
+    "jazz": (0, 4, 7, 10),        # 属七 / 小七（统一七和弦感）
     "classical": (0, 4, 7),
-    "folk":      (0, 7),           # 根 + 五度（power chord 感）
+    "folk": (0, 7),               # 根 + 五度（power chord 感）
 }
 
 
@@ -68,7 +68,7 @@ def _swing(notes: list[pretty_midi.Note], ratio: float = 2.0 / 3.0) -> None:
         if abs(da - db) < 0.05 and da < 0.4 and abs(b.start - a.end) < 0.02:
             total = da + db
             new_a_end = a.start + total * ratio
-            a.end   = new_a_end
+            a.end = new_a_end
             b.start = new_a_end
             i += 2
         else:
@@ -81,7 +81,8 @@ def _add_trill(notes: list[pretty_midi.Note], min_dur: float = 0.5,
     out = []
     for n in notes:
         if n.end - n.start < min_dur:
-            out.append(n); continue
+            out.append(n)
+            continue
         t = n.start
         toggle = 0
         while t < n.end:
@@ -191,7 +192,7 @@ def _make_chord_track(style: str, key_root: int, total: float, beat_dur: float,
                     end=min(t + (k + 1) * step + 0.3, t + dur)))
         elif style == "classical":
             # 阿尔贝蒂半速：8 分音符 → 2 拍一次
-            pat = [pitches[0], pitches[-1], pitches[len(pitches)//2], pitches[-1]]
+            pat = [pitches[0], pitches[-1], pitches[len(pitches) // 2], pitches[-1]]
             sub = beat_dur
             n_sub = int(dur / sub)
             for k in range(n_sub):
@@ -257,7 +258,7 @@ def _quantize_notes(notes: list[pretty_midi.Note], beat_dur: float,
     step = beat_dur / grid
     for n in notes:
         n.start = round(n.start / step) * step
-        n.end   = round(n.end   / step) * step
+        n.end = round(n.end / step) * step
         if n.end <= n.start:
             n.end = n.start + step
 
@@ -271,7 +272,7 @@ def _shift_to_zero(notes: list[pretty_midi.Note]) -> None:
         return
     for n in notes:
         n.start -= offset
-        n.end   -= offset
+        n.end -= offset
 
 
 def _make_drum_track(style: str, total: float, beat_dur: float) -> pretty_midi.Instrument:
@@ -321,6 +322,7 @@ def _stylize_pop(ns, bd):
     _apply_articulation(ns, "pop")
     return ns
 
+
 def _stylize_jazz(ns, bd):
     _shift_to_zero(ns)
     _quantize_notes(ns, bd)
@@ -329,12 +331,14 @@ def _stylize_jazz(ns, bd):
     _apply_articulation(ns, "jazz")
     return ns
 
+
 def _stylize_classical(ns, bd):
     _shift_to_zero(ns)
     _quantize_notes(ns, bd)
     _apply_envelope(ns, bd, "classical")
     _apply_articulation(ns, "classical")
     return _add_trill(ns)
+
 
 def _stylize_folk(ns, bd):
     _shift_to_zero(ns)
@@ -343,11 +347,12 @@ def _stylize_folk(ns, bd):
     _apply_articulation(ns, "folk")
     return ns
 
+
 STYLIZERS: dict[str, Callable[[list[pretty_midi.Note], float], list[pretty_midi.Note]]] = {
-    "pop":       _stylize_pop,
-    "jazz":      _stylize_jazz,
+    "pop": _stylize_pop,
+    "jazz": _stylize_jazz,
     "classical": _stylize_classical,
-    "folk":      _stylize_folk,
+    "folk": _stylize_folk,
 }
 
 
