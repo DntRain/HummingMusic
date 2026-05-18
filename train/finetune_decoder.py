@@ -41,6 +41,36 @@ STYLE_DIRS = {
 }
 
 
+def _extract_melody_track(midi: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
+    """
+    从多轨 MIDI 中提取最像旋律的单轨。
+
+    评分标准（越高越像旋律）：
+      - 平均音高高（旋律通常是最高声部）
+      - 同时发音少（单声部稀疏）
+      - 音符数量多（主要旋律轨）
+
+    返回只含该轨的新 PrettyMIDI 对象。
+    """
+    melody_tracks = [t for t in midi.instruments if not t.is_drum and len(t.notes) > 0]
+    if not melody_tracks:
+        return midi  # 全是打击乐，原样返回
+
+    def track_score(track):
+        notes = track.notes
+        avg_pitch = np.mean([n.pitch for n in notes])
+        # 同一时刻平均同时发音数（越低越像单声部）
+        roll = track.get_piano_roll(fs=FRAME_RATE)
+        avg_poly = roll.astype(bool).sum(axis=0).mean() + 1e-6
+        n_notes = len(notes)
+        return avg_pitch / avg_poly + np.log1p(n_notes) * 0.1
+
+    best = max(melody_tracks, key=track_score)
+    out = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+    out.instruments.append(best)
+    return out
+
+
 class StyleMidiDataset(Dataset):
     def __init__(self, midi_dir: Path) -> None:
         self.segments: list[np.ndarray] = []
@@ -48,12 +78,15 @@ class StyleMidiDataset(Dataset):
         for path in files:
             try:
                 midi = pretty_midi.PrettyMIDI(str(path))
+                midi = _extract_melody_track(midi)          # 只保留主旋律轨
                 roll = midi.get_piano_roll(fs=FRAME_RATE)[PITCH_LOW:PITCH_HIGH]
                 roll = (roll > 0).astype(np.float32)
                 T = roll.shape[1]
                 for start in range(0, T - SEG_LEN + 1, STEP):
                     seg = roll[:, start:start + SEG_LEN]
-                    if seg.sum() > 4:
+                    avg_poly = seg.astype(bool).sum(axis=0).mean()
+                    # 保留有音符、且平均同时发音 ≤ 2（旋律级别）的片段
+                    if seg.sum() > 4 and avg_poly <= 2.0:
                         self.segments.append(seg)
             except Exception as e:
                 logger.debug("跳过 %s: %s", path.name, e)

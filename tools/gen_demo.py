@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 # ── 常量 ──────────────────────────────────────────
 CKPT_PATH  = "models/quantizer_v5/bilstm_crf.pt"
 FRAME_STEP = 0.01   # CREPE 帧步长（秒）
-SF2_PATH   = "/home/DontRain/Projects/YOLO11n_Furnas/python312/lib/python3.12/site-packages/pretty_midi/TimGM6mb.sf2"
+_SF2_CANDIDATES = [
+    "/usr/share/soundfonts/FluidR3_GM2-2.sf2",
+    "/usr/share/soundfonts/FluidR3_GM.sf2",
+    "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+    "/home/DontRain/Projects/YOLO11n_Furnas/python312/lib/python3.12/site-packages/pretty_midi/TimGM6mb.sf2",
+]
+SF2_PATH = next(p for p in _SF2_CANDIDATES if Path(p).exists())
 SYNTH_SR   = 44100
 STYLES     = ["pop", "jazz", "classical", "folk"]
 
@@ -129,7 +135,9 @@ def style_transfer(pm: pretty_midi.PrettyMIDI, style: str,
         z_q, _ = model.encode(x)
         recon = decoders[style](z_q)   # 风格专属解码器
 
-    recon48 = (recon.squeeze(0).cpu().numpy()[:, :T] * 127).clip(0, 127)
+    # decoder 输出是 sigmoid 概率，用 0.5 做二分类阈值；保留原概率作 velocity
+    recon_prob = recon.squeeze(0).cpu().numpy()[:, :T]
+    recon48 = np.where(recon_prob > 0.5, (recon_prob * 127).clip(1, 127), 0).astype(np.float32)
     recon128 = np.zeros((128, T), dtype=np.float32)
     recon128[pitch_low:pitch_high] = recon48
 
@@ -221,17 +229,26 @@ def main() -> None:
     logger.info("Step 2: 加载 VQ-VAE")
     vq_model, decoders, cfg = load_vqvae(device)
 
-    # 3. 各风格迁移 + 渲染
+    # 3. 各风格迁移 + 后处理风格化 + 渲染
+    from src.style_postprocess import stylize
     for style in STYLES:
         if style not in decoders:
             logger.warning("[%s] 解码器缺失，跳过", style)
             continue
-        logger.info("Step 3 [%s]: 风格迁移", style)
+        logger.info("Step 3 [%s]: 风格迁移 + 后处理", style)
         styled_pm = style_transfer(melody_pm, style, vq_model, decoders, cfg, device)
+        # 用原始旋律估计 tempo，避免 stylize 内部用默认 120 导致拍号失配
+        try:
+            est_tempo = float(melody_pm.estimate_tempo())
+            if not (40 < est_tempo < 240):
+                est_tempo = 120.0
+        except Exception:
+            est_tempo = 120.0
+        final_pm  = stylize(styled_pm, style, tempo=est_tempo)
         mid_path  = str(out_dir / f"{style}.mid")
         wav_path  = str(out_dir / f"{style}.wav")
-        styled_pm.write(mid_path)
-        render_wav(styled_pm, wav_path)
+        final_pm.write(mid_path)
+        render_wav(final_pm, wav_path)
 
     logger.info("完成！输出目录: %s", out_dir)
     for f in sorted(out_dir.iterdir()):

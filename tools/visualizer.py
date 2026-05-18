@@ -39,9 +39,65 @@ SPLIT_JSON  = f"{DATA_ROOT}/train_valid_test_keys.json"
 WAV_DIR     = f"{DATA_ROOT}/all_wav/wav_data_sync_with_midi"
 MIDI_DIR    = f"{DATA_ROOT}/midi_data"
 FRAME_STEP  = 0.01  # 秒/帧
-SF2_PATH    = str(Path(__file__).parent.parent.parent /
-               "YOLO11n_Furnas/python312/lib/python3.12/site-packages/pretty_midi/TimGM6mb.sf2")
+_SF2_CANDIDATES = [
+    "/usr/share/soundfonts/FluidR3_GM2-2.sf2",
+    "/usr/share/soundfonts/FluidR3_GM.sf2",
+    "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+    str(Path(__file__).parent.parent.parent /
+        "YOLO11n_Furnas/python312/lib/python3.12/site-packages/pretty_midi/TimGM6mb.sf2"),
+]
+SF2_PATH    = next(p for p in _SF2_CANDIDATES if Path(p).exists())
 SYNTH_SR    = 22050
+
+DEMO_DIR    = Path(__file__).parent.parent / "data" / "demo"
+DEMO_WAV    = DEMO_DIR / "example.wav"
+DEMO_FEAT   = DEMO_DIR / "example.npy"
+
+
+def load_demo_item() -> dict:
+    """把内置演示音频包装成与 HumTransDataset 同结构的 item。"""
+    feat = np.load(DEMO_FEAT).astype(np.float32)
+    return {
+        "features": torch.from_numpy(feat),
+        "n_frames": len(feat),
+        "key":      "example",
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def extract_features_from_bytes(file_bytes: bytes, suffix: str) -> tuple[np.ndarray, bytes]:
+    """上传文件 → (特征 ndarray (T,4), 重采样后的 16k mono WAV bytes)。
+
+    用 tempdir 写入原始文件，必要时 ffmpeg 转 16k mono，再调用
+    train.extract_features.extract_one（CREPE 优先，pyin 回退）。
+    """
+    import subprocess
+    from train.extract_features import extract_one
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        src = td_path / f"upload{suffix.lower()}"
+        src.write_bytes(file_bytes)
+
+        wav16 = td_path / "example.wav"
+        if suffix.lower() == ".wav":
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src),
+                 "-ac", "1", "-ar", "16000", "-loglevel", "error", str(wav16)],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src),
+                 "-ac", "1", "-ar", "16000", "-loglevel", "error", str(wav16)],
+                check=True,
+            )
+
+        if not extract_one("example", td_path, td_path, force=True):
+            raise RuntimeError("特征提取失败（extract_one 返回 False）")
+        feat = np.load(td_path / "example.npy").astype(np.float32)
+        wav_bytes = wav16.read_bytes()
+        return feat, wav_bytes
 
 
 # ──────────────────────────────────────────────
@@ -167,6 +223,8 @@ def run_inference(item: dict, model, device, peak_distance: int, peak_height_sig
 # ──────────────────────────────────────────────
 def plot_piano_roll(pred_midi, gt_midi, duration: float, title: str = ""):
     def get_notes(midi):
+        if midi is None:
+            return []
         notes = []
         for inst in midi.instruments:
             if inst.is_drum:
@@ -289,10 +347,12 @@ MIN_DURATION_SEC   = 1.0    # 最短有效音频时长
 INFERENCE_TIMEOUT  = 10.0   # 推理超时阈值（秒）
 
 
-def validate_uploaded_audio(uploaded_file) -> tuple[bool, str, np.ndarray | None, int | None]:
+def validate_uploaded_audio(uploaded_file) -> tuple[bool, str, float | None, int | None]:
     """
-    返回 (ok, error_msg, audio_data, sr)
+    返回 (ok, error_msg, duration_sec, sample_rate)
     错误类型：格式错误 / 音频过短
+
+    用 ffprobe 探测元数据，兼容 soundfile 不支持的容器（如 m4a/aac）。
     """
     if uploaded_file is None:
         return False, "", None, None
@@ -301,20 +361,36 @@ def validate_uploaded_audio(uploaded_file) -> tuple[bool, str, np.ndarray | None
     if suffix not in ALLOWED_AUDIO_EXTS:
         return False, f"格式错误：不支持 {suffix} 格式，请上传 {' / '.join(sorted(ALLOWED_AUDIO_EXTS))} 文件。", None, None
 
+    import subprocess, json as _json
+    tmp = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(uploaded_file.getbuffer())
             tmp = f.name
-        audio, sr = sf.read(tmp)
-        os.unlink(tmp)
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_entries", "format=duration:stream=sample_rate,codec_type",
+             tmp],
+            capture_output=True, text=True, check=True,
+        )
+        info = _json.loads(probe.stdout)
+        astreams = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+        if not astreams:
+            return False, "格式错误：文件中未找到音频流。", None, None
+        duration = float(info.get("format", {}).get("duration", 0.0))
+        sr = int(astreams[0].get("sample_rate", 0))
+    except subprocess.CalledProcessError as e:
+        return False, f"格式错误：文件无法解析（{e.stderr.strip() or e}）", None, None
     except Exception as e:
         return False, f"格式错误：文件无法解析（{e}）", None, None
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
-    duration = len(audio) / sr
     if duration < MIN_DURATION_SEC:
         return False, f"音频过短：时长 {duration:.2f}s，最短需 {MIN_DURATION_SEC}s。请上传更长的录音。", None, None
 
-    return True, "", audio, sr
+    return True, "", duration, sr
 
 
 def run_inference_with_timeout(item, model, device, peak_distance, peak_height_sigma):
@@ -330,7 +406,13 @@ def run_inference_with_timeout(item, model, device, peak_distance, peak_height_s
 # ── 侧边栏 ──
 with st.sidebar:
     st.header("设置")
-    split = st.selectbox("数据集分片", ["TEST", "VALID", "TRAIN"], index=0)
+    use_demo = st.toggle(
+        "🎤 使用演示样本 (example.m4a)",
+        value=False,
+        help="跳过数据集，直接用内置的真实哼唱跑端到端 pipeline（无 GT，仅展示预测结果）",
+    )
+    split = st.selectbox("数据集分片", ["TEST", "VALID", "TRAIN"], index=0,
+                         disabled=use_demo)
     correct_octave = st.checkbox("八度偏移自动修正", value=True)
     peak_distance = st.slider("峰值最小间距（帧，1帧=10ms）", 5, 50, 20)
     peak_height_sigma = st.slider("峰值高度阈值 (均值 + σ * std)", 0.0, 3.0, 0.5, 0.1)
@@ -344,42 +426,57 @@ with st.sidebar:
         "Synth Lead",
     ], index=0)
     st.markdown("---")
+    st.subheader("现场录音")
+    recorded_audio = st.audio_input("🎙️ 点击麦克风开始录音")
+    st.markdown("---")
     st.subheader("上传自定义音频")
     uploaded_file = st.file_uploader("上传哼唱音频", type=["wav","mp3","flac","ogg","m4a","txt","bin"])
     st.markdown("---")
+    if st.button("🔄 清空推理结果（录视频重录用）", use_container_width=True):
+        st.session_state.pop("confirmed_input_fp", None)
+        st.rerun()
     st.caption("模型: BiLSTM-CRF v5\nCREPE 特征 + GT 对齐\n全量 13080 训练样本")
 
-# ── 错误演示区（顶部） ──
-st.markdown("## 错误提示演示")
-demo_col1, demo_col2, demo_col3 = st.columns(3)
-with demo_col1:
-    if st.button("触发：格式错误"):
-        st.session_state["demo_error"] = "format"
-with demo_col2:
-    if st.button("触发：音频过短"):
-        st.session_state["demo_error"] = "short"
-with demo_col3:
-    if st.button("触发：推理超时"):
-        st.session_state["demo_error"] = "timeout"
-if st.button("清除错误演示", type="secondary"):
-    st.session_state.pop("demo_error", None)
+# ── 录音 / 上传音频实时验证 ──
+# 优先级：现场录音 > 文件上传
+audio_source = recorded_audio if recorded_audio is not None else uploaded_file
+audio_source_label = "现场录音" if recorded_audio is not None else (
+    f"上传：{uploaded_file.name}" if uploaded_file is not None else None
+)
 
-demo_error = st.session_state.get("demo_error")
-if demo_error == "format":
-    st.error("❌ 格式错误：不支持 .mp4 格式，请上传 .flac / .m4a / .mp3 / .ogg / .wav 文件。")
-    st.info("💡 支持的格式：WAV、MP3、FLAC、OGG、M4A")
-elif demo_error == "short":
-    st.warning("⚠️ 音频过短：时长 0.43s，最短需 1.0s。请上传更长的录音。")
-    st.info("💡 建议：录制至少 2 秒以上的哼唱片段，以获得准确的音符量化结果。")
-elif demo_error == "timeout":
-    st.error("⏱️ 推理超时：模型处理时间超过 10s 限制。")
-    st.info("💡 建议：缩短音频时长（推荐 10–30s），或降低 CREPE 精度到 `small` 以加速推理。")
+# 计算当前输入指纹：用于自定义音频/演示模式的"手动触发推理"按钮
+if audio_source is not None:
+    _src_kind = "rec" if recorded_audio is not None else "up"
+    current_input_fp = f"{_src_kind}:{getattr(audio_source, 'name', '?')}:{getattr(audio_source, 'size', 0)}"
+elif use_demo:
+    current_input_fp = "demo"
+else:
+    current_input_fp = None  # 数据集模式：slider 实时刷新，不用按钮
 
-st.markdown("---")
+def _render_run_button(label_suffix: str = ""):
+    """渲染"开始推理"按钮，未触发则 st.stop()。"""
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        clicked = st.button(
+            f"🚀 开始推理{label_suffix}",
+            type="primary",
+            use_container_width=True,
+            key=f"run_btn_{current_input_fp}",
+        )
+    if clicked:
+        st.session_state["confirmed_input_fp"] = current_input_fp
+    with c2:
+        if st.session_state.get("confirmed_input_fp") == current_input_fp:
+            st.success(f"✅ 已触发推理（指纹 `{current_input_fp}`）")
+        else:
+            st.info("👆 点击按钮开始推理（录视频时可手动触发，避免上传即出结果）")
+    if st.session_state.get("confirmed_input_fp") != current_input_fp:
+        st.stop()
 
-# ── 上传音频实时验证 ──
-if uploaded_file is not None:
-    ok, err_msg, audio_data, sr = validate_uploaded_audio(uploaded_file)
+upload_feat: np.ndarray | None = None
+upload_wav_bytes: bytes | None = None
+if audio_source is not None:
+    ok, err_msg, duration_sec, sr = validate_uploaded_audio(audio_source)
     if not ok:
         if "格式" in err_msg:
             st.error(f"❌ {err_msg}")
@@ -389,41 +486,73 @@ if uploaded_file is not None:
             st.info("💡 建议：录制至少 2 秒以上的哼唱片段，以获得准确的音符量化结果。")
         st.stop()
     else:
-        st.success(f"✅ 已上传：{uploaded_file.name}（{len(audio_data)/sr:.1f}s，{sr}Hz）")
-        st.audio(uploaded_file)
-        st.info("ℹ️ 上传音频的 CREPE 特征提取与量化推理功能即将支持，当前请使用数据集样本。")
-        st.stop()
+        st.success(f"✅ {audio_source_label}（{duration_sec:.1f}s，{sr}Hz）")
+        # 手动触发：未点击按钮则停在此处，UI 显示元数据但不跑特征/推理
+        _render_run_button(" / 重新推理")
+        # st.audio_input 返回的对象 .name 可能不带后缀，统一回退到 .wav
+        suffix = Path(getattr(audio_source, "name", "recording.wav")).suffix or ".wav"
+        try:
+            with st.spinner("提取 CREPE 特征中（约 5–15s）..."):
+                upload_feat, upload_wav_bytes = extract_features_from_bytes(
+                    audio_source.getbuffer().tobytes(), suffix,
+                )
+            st.success(f"✅ 特征提取完成：{upload_feat.shape[0]} 帧 "
+                       f"({int((upload_feat[:,1]>0).sum())} 有效)")
+        except Exception as e:
+            st.error(f"❌ 特征提取失败：{e}")
+            st.stop()
 
 # ── 加载资源 ──
 with st.spinner("加载模型..."):
     model, device = load_model()
 
-with st.spinner(f"加载 {split} 数据集..."):
-    ds = load_dataset(split, correct_octave=correct_octave)
+upload_mode = upload_feat is not None
+if upload_mode:
+    mode_label = "现场录音" if recorded_audio is not None else f"上传 {uploaded_file.name}"
+    st.info(f"🎤 自定义音频模式：{mode_label}，跳过数据集与 GT 评估")
+    key_name = "recording" if recorded_audio is not None else Path(uploaded_file.name).stem
+    item = {
+        "features": torch.from_numpy(upload_feat),
+        "n_frames": len(upload_feat),
+        "key":      key_name,
+    }
+    key = item["key"]
+    n_frames = item["n_frames"]
+    duration = n_frames * FRAME_STEP
+    st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {n_frames}")
+elif use_demo:
+    st.info("🎤 演示模式：使用内置 example.m4a（你的哼唱），跳过数据集与 GT 评估")
+    _render_run_button(" / 重新推理")
+    item = load_demo_item()
+    key = item["key"]
+    n_frames = item["n_frames"]
+    duration = n_frames * FRAME_STEP
+    st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {n_frames}")
+else:
+    with st.spinner(f"加载 {split} 数据集..."):
+        ds = load_dataset(split, correct_octave=correct_octave)
+    st.success(f"已加载 {len(ds)} 条样本")
 
-st.success(f"已加载 {len(ds)} 条样本")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        idx = st.slider("样本索引", 0, len(ds) - 1, 0)
+    with col2:
+        key_input = st.text_input("或直接输入 key")
 
-# ── 样本选择 ──
-col1, col2 = st.columns([3, 1])
-with col1:
-    idx = st.slider("样本索引", 0, len(ds) - 1, 0)
-with col2:
-    key_input = st.text_input("或直接输入 key")
+    if key_input:
+        key_list = [ds.keys[i] for i in range(len(ds))]
+        if key_input in key_list:
+            idx = key_list.index(key_input)
+            st.info(f"找到 key: {key_input}，index={idx}")
+        else:
+            st.warning(f"未找到 key: {key_input}")
 
-if key_input:
-    key_list = [ds.keys[i] for i in range(len(ds))]
-    if key_input in key_list:
-        idx = key_list.index(key_input)
-        st.info(f"找到 key: {key_input}，index={idx}")
-    else:
-        st.warning(f"未找到 key: {key_input}")
+    item = ds[idx]
+    key = item["key"]
+    n_frames = item["n_frames"]
+    duration = n_frames * FRAME_STEP
 
-item = ds[idx]
-key = item["key"]
-n_frames = item["n_frames"]
-duration = n_frames * FRAME_STEP
-
-st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {n_frames}")
+    st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {n_frames}")
 
 # ── 推理 ──
 with st.spinner("模型推理..."):
@@ -434,45 +563,76 @@ if result is None:
     st.info("💡 建议：缩短音频时长（推荐 10–30s），或降低 CREPE 精度到 `small` 以加速推理。")
     st.stop()
 
-gt_midi_path = Path(MIDI_DIR) / f"{key}.mid"
-gt_midi = pretty_midi.PrettyMIDI(str(gt_midi_path))
-metrics = compute_note_metrics(result["pred_midi"], gt_midi)
+no_gt = use_demo or upload_mode
+if no_gt:
+    gt_midi = None
+    metrics = None
+    pred_n = sum(len(i.notes) for i in result["pred_midi"].instruments)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("预测音符数", pred_n)
+    c2.metric("时长",       f"{duration:.1f}s")
+    c3.metric("帧数",       n_frames)
+else:
+    gt_midi_path = Path(MIDI_DIR) / f"{key}.mid"
+    gt_midi = pretty_midi.PrettyMIDI(str(gt_midi_path))
+    metrics = compute_note_metrics(result["pred_midi"], gt_midi)
 
-# ── 指标卡片 ──
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Note Accuracy", f"{metrics.note_accuracy:.3f}")
-c2.metric("Precision",     f"{metrics.precision:.3f}")
-c3.metric("F1",            f"{metrics.f1:.3f}")
-c4.metric("GT 音符数",     metrics.n_gt)
-c5.metric("预测音符数",    metrics.n_pred)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Note Accuracy", f"{metrics.note_accuracy:.3f}")
+    c2.metric("Precision",     f"{metrics.precision:.3f}")
+    c3.metric("F1",            f"{metrics.f1:.3f}")
+    c4.metric("GT 音符数",     metrics.n_gt)
+    c5.metric("预测音符数",    metrics.n_pred)
 
 # ── 音频播放 ──
 st.subheader("音频对比")
-audio_col1, audio_col2, audio_col3 = st.columns(3)
+if upload_mode:
+    orig_wav_bytes = upload_wav_bytes
+elif use_demo:
+    orig_wav_bytes = DEMO_WAV.read_bytes()
+else:
+    p = Path(WAV_DIR) / f"{key}.wav"
+    orig_wav_bytes = p.read_bytes() if p.exists() else None
 
-wav_path = Path(WAV_DIR) / f"{key}.wav"
-with audio_col1:
-    st.markdown("**原始哼唱**")
-    if wav_path.exists():
-        with open(wav_path, "rb") as f:
-            st.audio(f.read(), format="audio/wav")
-    else:
-        st.warning("WAV 文件不存在")
+if no_gt:
+    audio_col1, audio_col2 = st.columns(2)
+    with audio_col1:
+        st.markdown("**原始哼唱（你的录音）**" if upload_mode or use_demo else "**原始哼唱**")
+        if orig_wav_bytes:
+            st.audio(orig_wav_bytes, format="audio/wav")
+        else:
+            st.warning("WAV 不存在")
+    with audio_col2:
+        st.markdown("**预测 MIDI 合成**")
+        with st.spinner("合成预测..."):
+            pred_wav = synthesize_midi(midi_to_bytes(result["pred_midi"]), instrument_name)
+        st.audio(pred_wav, format="audio/wav")
+else:
+    audio_col1, audio_col2, audio_col3 = st.columns(3)
+    with audio_col1:
+        st.markdown("**原始哼唱**")
+        if orig_wav_bytes:
+            st.audio(orig_wav_bytes, format="audio/wav")
+        else:
+            st.warning("WAV 文件不存在")
 
-with audio_col2:
-    st.markdown("**GT MIDI 合成**")
-    with st.spinner("合成 GT..."):
-        gt_wav = synthesize_midi(midi_to_bytes(gt_midi), instrument_name)
-    st.audio(gt_wav, format="audio/wav")
+    with audio_col2:
+        st.markdown("**GT MIDI 合成**")
+        with st.spinner("合成 GT..."):
+            gt_wav = synthesize_midi(midi_to_bytes(gt_midi), instrument_name)
+        st.audio(gt_wav, format="audio/wav")
 
-with audio_col3:
-    st.markdown("**预测 MIDI 合成**")
-    with st.spinner("合成预测..."):
-        pred_wav = synthesize_midi(midi_to_bytes(result["pred_midi"]), instrument_name)
-    st.audio(pred_wav, format="audio/wav")
+    with audio_col3:
+        st.markdown("**预测 MIDI 合成**")
+        with st.spinner("合成预测..."):
+            pred_wav = synthesize_midi(midi_to_bytes(result["pred_midi"]), instrument_name)
+        st.audio(pred_wav, format="audio/wav")
 
 # ── 钢琴卷帘 ──
-st.subheader("钢琴卷帘对比（绿色填充=GT，蓝色边框=预测）")
+if no_gt:
+    st.subheader("钢琴卷帘（蓝色边框=预测；无 GT）")
+else:
+    st.subheader("钢琴卷帘对比（绿色填充=GT，蓝色边框=预测）")
 fig_roll = plot_piano_roll(result["pred_midi"], gt_midi, duration, title=f"{key}")
 if fig_roll:
     st.pyplot(fig_roll, use_container_width=True)
@@ -485,8 +645,8 @@ st.pyplot(fig_score, use_container_width=True)
 plt.close(fig_score)
 
 # ── 音符对比表 ──
-st.subheader("音符列表对比")
-col_gt, col_pred = st.columns(2)
+st.subheader("音符列表对比" if not no_gt else "预测音符列表")
+col_gt, col_pred = (None, None) if no_gt else st.columns(2)
 
 def get_note_rows(midi):
     rows = []
@@ -505,15 +665,20 @@ def get_note_rows(midi):
     return rows
 
 import pandas as pd
-with col_gt:
-    st.markdown("**GT 音符**")
-    gt_rows = get_note_rows(gt_midi)
-    st.dataframe(pd.DataFrame(gt_rows), use_container_width=True, height=400)
-
-with col_pred:
+if no_gt:
     st.markdown("**预测音符**")
     pred_rows = get_note_rows(result["pred_midi"])
     st.dataframe(pd.DataFrame(pred_rows), use_container_width=True, height=400)
+else:
+    with col_gt:
+        st.markdown("**GT 音符**")
+        gt_rows = get_note_rows(gt_midi)
+        st.dataframe(pd.DataFrame(gt_rows), use_container_width=True, height=400)
+
+    with col_pred:
+        st.markdown("**预测音符**")
+        pred_rows = get_note_rows(result["pred_midi"])
+        st.dataframe(pd.DataFrame(pred_rows), use_container_width=True, height=400)
 
 # ── 风格迁移对比 ──
 st.markdown("---")
@@ -577,7 +742,9 @@ def run_style_transfer(midi_bytes: bytes, style: str) -> bytes:
         z_q, _ = vq.encode(x)
         recon = decoders[style](z_q)   # 用风格专属解码器
 
-    recon48 = (recon.squeeze(0).numpy()[:, :T] * 127).clip(0, 127)
+    # decoder 输出 sigmoid 概率，用 0.5 阈值；否则 ~1.97% 的微小值会被当激活
+    recon_prob = recon.squeeze(0).numpy()[:, :T]
+    recon48 = np.where(recon_prob > 0.5, (recon_prob * 127).clip(1, 127), 0).astype(np.float32)
     recon128 = np.zeros((128, T), dtype=np.float32)
     recon128[pitch_low:pitch_high] = recon48
 
@@ -586,10 +753,8 @@ def run_style_transfer(midi_bytes: bytes, style: str) -> bytes:
     except ValueError:
         bpm = 120.0
     frame_dur = 1.0 / frame_rate
-    from src.style_transfer import STYLE_PROGRAMS
-    progs = STYLE_PROGRAMS.get(style, STYLE_PROGRAMS["pop"])
-    out = pretty_midi.PrettyMIDI(initial_tempo=bpm)
-    inst = pretty_midi.Instrument(program=progs["melody"], name="melody")
+    melody_only = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    inst = pretty_midi.Instrument(program=0, name="melody")
     for pitch in range(128):
         active = recon128[pitch] > 0
         if not np.any(active):
@@ -600,7 +765,10 @@ def run_style_transfer(midi_bytes: bytes, style: str) -> bytes:
         for s, e in zip(starts, ends):
             vel = max(1, min(127, int(np.mean(recon128[pitch, s:e]))))
             inst.notes.append(pretty_midi.Note(vel, pitch, s*frame_dur, e*frame_dur))
-    out.instruments.append(inst)
+    melody_only.instruments.append(inst)
+
+    from src.style_postprocess import stylize
+    out = stylize(melody_only, style, tempo=bpm)
     return midi_to_bytes(out)
 
 with st.spinner("加载 VQ-VAE..."):
