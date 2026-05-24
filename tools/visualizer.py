@@ -5,7 +5,12 @@ tools/visualizer.py - BiLSTM-CRF 量化器交互式可视化工具
     streamlit run tools/visualizer.py
 """
 
+import os
+# Bug-05 修复：在导入 fluidsynth/pretty_midi 之前抑制 ALSA 硬件探测警告
+os.environ.setdefault("FLUID_NO_AUDIO_DRIVERS", "1")
+
 import sys
+import contextlib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -13,7 +18,6 @@ import io
 import json
 import time
 import tempfile
-import os
 import numpy as np
 import pretty_midi
 import soundfile as sf
@@ -131,21 +135,38 @@ def load_dataset(split: str, correct_octave: bool = True):
 # ──────────────────────────────────────────────
 # MIDI 合成
 # ──────────────────────────────────────────────
+@contextlib.contextmanager
+def _silence_stderr_fd():
+    """Bug-05 修复：用 fd 级别重定向吞掉 fluidsynth/libasound 的 C 层 stderr。
+
+    Python 的 sys.stderr 重定向对 C 扩展无效，必须 os.dup2 操作 fd 2。
+    仅在 fluidsynth 合成期间生效，结束后立即恢复，不影响 Streamlit 日志。
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_fd = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        os.close(devnull_fd)
+
+
 @st.cache_data(max_entries=20)
 def synthesize_midi(midi_bytes: bytes, instrument_name: str = "Acoustic Grand Piano") -> bytes:
     """将 MIDI bytes 合成为 WAV bytes（用于 st.audio 播放）。"""
-    import tempfile, os
     with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
         f.write(midi_bytes)
         tmp_path = f.name
     try:
         pm = pretty_midi.PrettyMIDI(tmp_path)
-        # 统一音色为钢琴
         program = pretty_midi.instrument_name_to_program(instrument_name)
         for inst in pm.instruments:
             if not inst.is_drum:
                 inst.program = program
-        audio = pm.fluidsynth(fs=SYNTH_SR, sf2_path=SF2_PATH)
+        with _silence_stderr_fd():
+            audio = pm.fluidsynth(fs=SYNTH_SR, sf2_path=SF2_PATH)
         # 归一化防止截幅
         if np.abs(audio).max() > 0:
             audio = audio / np.abs(audio).max() * 0.9
@@ -529,9 +550,16 @@ elif use_demo:
     duration = n_frames * FRAME_STEP
     st.markdown(f"**Key:** `{key}`  |  **时长:** {duration:.1f}s  |  **帧数:** {n_frames}")
 else:
-    with st.spinner(f"加载 {split} 数据集..."):
+    # Bug-06 修复：给出预期耗时与样本规模，避免 TRAIN 集首次加载"看似卡住"
+    _split_hint = {
+        "TEST":  "769 样本，约 0.5s",
+        "VALID": "765 样本，约 0.5s",
+        "TRAIN": "13080 样本，首次加载约 8-12s（已缓存后秒返）",
+    }[split]
+    with st.spinner(f"加载 {split} 数据集（{_split_hint}）..."):
+        _t0_ds = time.time()
         ds = load_dataset(split, correct_octave=correct_octave)
-    st.success(f"已加载 {len(ds)} 条样本")
+    st.success(f"已加载 {len(ds)} 条样本（耗时 {time.time() - _t0_ds:.1f}s）")
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -561,6 +589,20 @@ with st.spinner("模型推理..."):
 if result is None:
     st.error(f"⏱️ 推理超时：模型处理时间 {elapsed:.1f}s 超过 {INFERENCE_TIMEOUT}s 限制。")
     st.info("💡 建议：缩短音频时长（推荐 10–30s），或降低 CREPE 精度到 `small` 以加速推理。")
+    st.stop()
+
+# Bug-04 修复：空音符态友好提示（静音 / 纯噪声 / 信号过弱）
+_pred_n_check = sum(len(i.notes) for i in result["pred_midi"].instruments)
+_valid_ratio = float(result["valid_mask"].mean()) if result["n"] else 0.0
+if _pred_n_check == 0:
+    st.warning("⚠️ 未检测到有效音符：哼唱信号可能过弱、为静音或噪声。")
+    diag = []
+    if _valid_ratio < 0.1:
+        diag.append(f"有效帧占比仅 {_valid_ratio:.1%}（CREPE 置信度过低）")
+    if len(result["peaks"]) == 0:
+        diag.append("BiLSTM 未在任何帧检出音符起始")
+    st.caption("诊断：" + "；".join(diag) if diag else "诊断：模型输出全空")
+    st.info("💡 建议：贴近麦克风、提高音量、在安静环境下录制，时长 3-15s，避免哨音或纯念字。")
     st.stop()
 
 no_gt = use_demo or upload_mode

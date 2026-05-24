@@ -76,14 +76,24 @@ def _swing(notes: list[pretty_midi.Note], ratio: float = 2.0 / 3.0) -> None:
 
 
 def _add_trill(notes: list[pretty_midi.Note], min_dur: float = 0.5,
-               step: int = 1, rate: float = 0.0625) -> list[pretty_midi.Note]:
-    """长音颤音：把 > min_dur 的音替换为本音/上邻音交替。"""
+               step: int = 1, rate: float = 0.0625,
+               tail_only: float = 1.0) -> list[pretty_midi.Note]:
+    """长音颤音：把 > min_dur 的音替换为本音/上邻音交替。
+
+    tail_only: 颤音只覆盖音符末尾的比例（默认 1.0 = 全程颤音，
+               0.33 = 仅后 1/3 颤音；古典真实演奏多为持续音后接装饰）。
+    """
     out = []
     for n in notes:
-        if n.end - n.start < min_dur:
+        dur = n.end - n.start
+        if dur < min_dur:
             out.append(n)
             continue
-        t = n.start
+        trill_start = n.start + dur * (1.0 - tail_only)
+        if trill_start > n.start:
+            out.append(pretty_midi.Note(velocity=n.velocity, pitch=n.pitch,
+                                        start=n.start, end=trill_start))
+        t = trill_start
         toggle = 0
         while t < n.end:
             p = n.pitch + (step if toggle else 0)
@@ -191,15 +201,17 @@ def _make_chord_track(style: str, key_root: int, total: float, beat_dur: float,
                     velocity=50, pitch=p, start=t + k * step,
                     end=min(t + (k + 1) * step + 0.3, t + dur)))
         elif style == "classical":
-            # 阿尔贝蒂半速：8 分音符 → 2 拍一次
+            # Bug-08 修复：阿尔贝蒂原 sub=beat_dur（每拍 1 音），过密；
+            # 改为 sub=beat_dur*2（每 2 拍 1 音），降到原密度的 50%，
+            # 与古典实际伴奏的「半音符 broken chord」更接近
             pat = [pitches[0], pitches[-1], pitches[len(pitches) // 2], pitches[-1]]
-            sub = beat_dur
+            sub = beat_dur * 2
             n_sub = int(dur / sub)
             for k in range(n_sub):
                 p = pat[k % len(pat)]
                 inst.notes.append(pretty_midi.Note(
                     velocity=45, pitch=p, start=t + k * sub,
-                    end=t + (k + 1) * sub))
+                    end=t + (k + 1) * sub - 0.02))
         else:  # pop / folk: 半音符 block chord（2 拍一击，留呼吸）
             sub = beat_dur * 2
             n_sub = int(dur / sub)
@@ -337,7 +349,10 @@ def _stylize_classical(ns, bd):
     _quantize_notes(ns, bd)
     _apply_envelope(ns, bd, "classical")
     _apply_articulation(ns, "classical")
-    return _add_trill(ns)
+    # Bug-08 修复：颤音原 min_dur=0.5 / rate=0.0625（即 16Hz 颤音），密度过高听感糊
+    # 改为只对 ≥1.5s 长音颤音，rate=0.18s（≈ 5.5Hz）接近真人 vibrato，
+    # 且只在音符后 1/3 段加颤音（古典实演的"延音→装饰"语感）
+    return _add_trill(ns, min_dur=1.5, rate=0.18, tail_only=0.33)
 
 
 def _stylize_folk(ns, bd):
