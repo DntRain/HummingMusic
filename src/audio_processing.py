@@ -23,6 +23,15 @@ except ImportError:
     crepe = None
     CREPE_AVAILABLE = False
 
+try:
+    import torch
+    import torchcrepe
+    TORCHCREPE_AVAILABLE = True
+except ImportError:
+    torch = None
+    torchcrepe = None
+    TORCHCREPE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # 加载配置
@@ -65,25 +74,9 @@ def _load_and_resample(audio_path: str) -> tuple[np.ndarray, int]:
     return y, sr
 
 
-def _extract_f0(
+def _extract_f0_crepe(
     audio: np.ndarray, sr: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    使用 CREPE 提取基频。
-
-    Args:
-        audio: 单声道音频信号。
-        sr: 采样率。
-
-    Returns:
-        tuple: (time, frequency, confidence)
-            - time (np.ndarray): 时间戳，shape=(N,)
-            - frequency (np.ndarray): F0频率(Hz)，shape=(N,)
-            - confidence (np.ndarray): 置信度[0,1]，shape=(N,)
-    """
-    if not CREPE_AVAILABLE:
-        raise RuntimeError("crepe 未安装，无法提取音高")
-
     step_size = _config["crepe"]["step_size"]
     model_capacity = _config["crepe"]["model_capacity"]
     viterbi = _config["crepe"]["viterbi"]
@@ -98,6 +91,93 @@ def _extract_f0(
 
     logger.info("CREPE 提取完成: %d 帧", len(time))
     return time, frequency, confidence
+
+
+_TORCHCREPE_CAPACITY_MAP = {
+    "tiny": "tiny", "small": "tiny", "medium": "full",
+    "large": "full", "full": "full",
+}
+
+
+def _extract_f0_torchcrepe(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """torchcrepe（PyTorch + GPU）实现，比官方 crepe 更快、无 TF 依赖。"""
+    step_ms = _config["crepe"]["step_size"]
+    capacity = _TORCHCREPE_CAPACITY_MAP.get(
+        _config["crepe"]["model_capacity"], "full")
+    viterbi = _config["crepe"]["viterbi"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_t = torch.from_numpy(audio).float().unsqueeze(0)
+    decoder = (torchcrepe.decode.viterbi if viterbi
+               else torchcrepe.decode.argmax)
+    fmin = 50.0
+    fmax = torchcrepe.MAX_FMAX
+
+    with torch.no_grad():
+        pitch, periodicity = torchcrepe.predict(
+            audio_t, sr, hop_length, fmin, fmax,
+            model=capacity, batch_size=2048,
+            device=device, decoder=decoder, return_periodicity=True,
+        )
+
+    frequency = pitch.squeeze(0).cpu().numpy()
+    confidence = periodicity.squeeze(0).cpu().numpy()
+    time = np.arange(len(frequency)) * hop_length / sr
+    logger.info("torchcrepe(%s/%s) 提取完成: %d 帧",
+                capacity, device, len(time))
+    return time, frequency, confidence
+
+
+def _extract_f0_pyin(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """librosa.pyin 回退实现：用于无 CREPE/TensorFlow 的环境（如本机 benchmark）。"""
+    step_ms = _config["crepe"]["step_size"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
+    frame_length = max(hop_length * 4, 2048)
+    fmin = librosa.note_to_hz("C2")
+    fmax = librosa.note_to_hz("C7")
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        audio, fmin=fmin, fmax=fmax, sr=sr,
+        frame_length=frame_length, hop_length=hop_length,
+    )
+    n = len(f0)
+    time = np.arange(n) * hop_length / sr
+    confidence = np.where(voiced_flag, voiced_prob, 0.0)
+    frequency = np.where(np.isnan(f0), 0.0, f0)
+    logger.info("pyin 提取完成: %d 帧", n)
+    return time, frequency, confidence
+
+
+def _extract_f0(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """提取基频。
+
+    config.audio.pitch_backend = 'auto' | 'torchcrepe' | 'crepe' | 'pyin'
+    auto 优先级：torchcrepe > crepe > pyin。
+    """
+    backend = _config.get("audio", {}).get("pitch_backend", "auto")
+    if backend == "torchcrepe":
+        if not TORCHCREPE_AVAILABLE:
+            raise RuntimeError("config 指定 torchcrepe 但未安装")
+        return _extract_f0_torchcrepe(audio, sr)
+    if backend == "crepe":
+        if not CREPE_AVAILABLE:
+            raise RuntimeError("config 指定 crepe 但未安装")
+        return _extract_f0_crepe(audio, sr)
+    if backend == "pyin":
+        return _extract_f0_pyin(audio, sr)
+    # auto
+    if TORCHCREPE_AVAILABLE:
+        return _extract_f0_torchcrepe(audio, sr)
+    if CREPE_AVAILABLE:
+        return _extract_f0_crepe(audio, sr)
+    logger.warning("CREPE/torchcrepe 均不可用，回退到 librosa.pyin")
+    return _extract_f0_pyin(audio, sr)
 
 
 def _filter_low_confidence(
