@@ -7,9 +7,10 @@ app.py - Gradio 主入口
 - 完整 pipeline 触发
 - 结果展示（音频播放、Piano Roll、MIDI下载）
 """
-# test
 import logging
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 import gradio as gr
@@ -17,23 +18,49 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pretty_midi
 import yaml
+from matplotlib import font_manager
+from matplotlib.patches import Patch
 
 from src.interfaces import extract_pitch, quantize_humming, render_audio, transfer_style
 
-# 使用非交互后端
 matplotlib.use("Agg")
 
-# 加载配置
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
     _config = yaml.safe_load(_f)
 
-# 配置日志
 logging.basicConfig(
     level=getattr(logging, _config["logging"]["level"]),
     format=_config["logging"]["format"],
 )
 logger = logging.getLogger(__name__)
+
+for fp in [
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+]:
+    if Path(fp).exists():
+        font_manager.fontManager.addfont(fp)
+        plt.rcParams["font.family"] = font_manager.FontProperties(fname=fp).get_name()
+        break
+plt.rcParams["axes.unicode_minus"] = False
+
+
+STYLE_CHOICES = [
+    ("🎵 流行 (pop)", "pop"),
+    ("🎷 爵士 (jazz)", "jazz"),
+    ("🎻 古典 (classical)", "classical"),
+    ("🪕 民谣 (folk)", "folk"),
+]
+
+# Fix #7: 各阶段在 0-1 进度条上的真实权重，按 Week12 延迟基线测量结果（extract_pitch ~98%）
+PROGRESS_WEIGHTS = {
+    "extract": (0.00, 0.85),
+    "quantize": (0.85, 0.88),
+    "style": (0.88, 0.92),
+    "render": (0.92, 0.97),
+    "viz": (0.97, 1.00),
+}
 
 
 # ──────────────────────────────────────────────
@@ -41,27 +68,25 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 def _plot_piano_roll(midi: pretty_midi.PrettyMIDI) -> str:
-    """
-    绘制 Piano Roll 可视化图像。
-
-    Args:
-        midi: PrettyMIDI 对象。
-
-    Returns:
-        str: 图像文件路径。
-    """
     fig, ax = plt.subplots(figsize=(12, 4))
+    melody_color, accomp_color = "steelblue", "coral"
 
     for instrument in midi.instruments:
+        color = melody_color if instrument.name == "melody" else accomp_color
         for note in instrument.notes:
             ax.barh(
-                note.pitch,
-                note.end - note.start,
-                left=note.start,
-                height=0.8,
-                alpha=0.7,
-                color="steelblue" if instrument.name == "melody" else "coral",
+                note.pitch, note.end - note.start,
+                left=note.start, height=0.8, alpha=0.7, color=color,
             )
+
+    # Fix #5: Piano Roll 添加图例
+    ax.legend(
+        handles=[
+            Patch(facecolor=melody_color, alpha=0.7, label="旋律 (melody)"),
+            Patch(facecolor=accomp_color, alpha=0.7, label="伴奏 (accompaniment)"),
+        ],
+        loc="upper right",
+    )
 
     ax.set_xlabel("时间 (秒)")
     ax.set_ylabel("MIDI 音高")
@@ -69,27 +94,33 @@ def _plot_piano_roll(midi: pretty_midi.PrettyMIDI) -> str:
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    # 保存到临时文件
     tmp_path = tempfile.mktemp(suffix=".png")
     fig.savefig(tmp_path, dpi=100, bbox_inches="tight")
     plt.close(fig)
     return tmp_path
 
 
-def _get_midi_path(wav_path: str) -> str | None:
-    """
-    从 WAV 路径推断同目录下的 MIDI 文件路径。
+def _save_midi(midi: pretty_midi.PrettyMIDI) -> str:
+    """Fix #1: 直接把 styled MIDI 写入唯一临时文件，供前端下载。
 
-    Args:
-        wav_path: WAV 文件路径。
-
-    Returns:
-        str | None: MIDI 文件路径，不存在则返回 None。
+    原实现从 wav 路径推断 .mid，但 render_audio 不产 MIDI，导致下载永远为空。
     """
-    midi_path = str(Path(wav_path).with_suffix(".mid"))
-    if Path(midi_path).exists():
-        return midi_path
-    return None
+    out_dir = Path(tempfile.gettempdir()) / f"hum_{uuid.uuid4().hex[:8]}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    midi_path = out_dir / "styled.mid"
+    midi.write(str(midi_path))
+    return str(midi_path)
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Fix #9: 异常脱敏，给用户友好提示，详细 traceback 只写日志。"""
+    logger.exception("Pipeline 失败: %s", exc)
+    name = type(exc).__name__
+    if isinstance(exc, FileNotFoundError):
+        return "❌ 找不到音频文件，请重新录音或上传。"
+    if isinstance(exc, ValueError):
+        return f"❌ 输入参数不合法（{name}），请检查后重试。"
+    return f"❌ 处理失败：{name}。已记录到服务端日志，请稍后重试或联系管理员。"
 
 
 # ──────────────────────────────────────────────
@@ -101,72 +132,61 @@ def process_humming(
     style: str,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str | None, str | None, str | None, str]:
-    """
-    完整处理流水线：音高提取 → 量化 → 风格迁移 → 渲染。
-
-    Args:
-        audio_input: 输入音频文件路径（来自录音或上传）。
-        style: 目标风格。
-        progress: Gradio 进度条。
-
-    Returns:
-        tuple: (wav_path, piano_roll_image_path, midi_path, status_message)
-    """
     if audio_input is None:
-        return None, None, None, "请先录音或上传音频文件。"
+        return None, None, None, "⚠️ 请先在左侧录音或上传音频文件。"
+
+    def _step(name: str, msg: str):
+        lo, _ = PROGRESS_WEIGHTS[name]
+        progress(lo, desc=msg)
 
     try:
-        # 阶段1：音高提取
-        progress(0.1, desc="正在提取音高...")
-        logger.info("Pipeline 开始: 音高提取")
-        pitch_data = extract_pitch(audio_input)
-        status = f"音高提取完成: {len(pitch_data['time'])} 帧, BPM={pitch_data['bpm']:.1f}\n"
+        t0 = time.perf_counter()
 
-        # 阶段2：量化
-        progress(0.3, desc="正在量化为MIDI...")
-        logger.info("Pipeline: 量化")
+        _step("extract", "🎤 正在提取音高...")
+        pitch_data = extract_pitch(audio_input)
+        t_extract = time.perf_counter() - t0
+        status = (f"✓ 音高提取完成：{len(pitch_data['time'])} 帧 "
+                  f"| BPM={pitch_data['bpm']:.1f} | {t_extract:.2f}s\n")
+
+        _step("quantize", "🎼 正在量化为 MIDI...")
         midi_quantized = quantize_humming(pitch_data)
         n_notes = sum(len(inst.notes) for inst in midi_quantized.instruments)
-        status += f"量化完成: {n_notes} 个音符\n"
+        status += f"✓ 量化完成：{n_notes} 个音符\n"
 
-        # 阶段3：风格迁移
-        progress(0.5, desc=f"正在进行风格迁移 ({style})...")
-        logger.info("Pipeline: 风格迁移 → %s", style)
+        _step("style", f"🎨 正在迁移风格 ({style})...")
         midi_styled = transfer_style(midi_quantized, style)
         n_tracks = len(midi_styled.instruments)
-        status += f"风格迁移完成: {n_tracks} 个轨道\n"
+        status += f"✓ 风格迁移完成：{n_tracks} 个轨道\n"
 
-        # 阶段4：渲染
-        progress(0.8, desc="正在渲染音频...")
-        logger.info("Pipeline: 渲染")
+        _step("render", "🔊 正在渲染音频...")
         wav_path = render_audio(midi_styled)
-        status += f"渲染完成: {wav_path}\n"
+        midi_path = _save_midi(midi_styled)
+        status += "✓ 渲染完成\n"
 
-        # 生成可视化
-        progress(0.9, desc="正在生成可视化...")
+        _step("viz", "🖼 正在生成可视化...")
         piano_roll_img = _plot_piano_roll(midi_styled)
-
-        # 获取MIDI文件路径
-        midi_path = _get_midi_path(wav_path)
-
         progress(1.0, desc="完成!")
-        status += "全部处理完成！"
-        logger.info("Pipeline 完成")
 
+        total = time.perf_counter() - t0
+        status += f"\n🎉 全部完成，总耗时 {total:.2f}s"
         return wav_path, piano_roll_img, midi_path, status
 
-    except FileNotFoundError as e:
-        msg = f"文件未找到: {e}"
-        logger.error(msg)
-        return None, None, None, msg
-    except ValueError as e:
-        msg = f"参数错误: {e}"
-        logger.error(msg)
-        return None, None, None, msg
-    except Exception as e:
-        msg = f"处理失败: {e}"
-        logger.exception(msg)
-        return None, None, None, msg
+    except Exception as exc:
+        return None, None, None, _friendly_error(exc)
+
+
+def _lock_button():
+    """Fix #2: 提交时立刻禁用按钮，防止并发点击。"""
+    return gr.update(value="⏳ 处理中…", interactive=False)
+
+
+def _unlock_button():
+    return gr.update(value="🎵 生成", interactive=True)
+
+
+def _stale_warning(_audio, _style):
+    """Fix #10: 风格变更时给出"结果已过期"提示。"""
+    return "ℹ️ 已修改输入/风格，请点击「生成」重新处理。"
 
 
 # ──────────────────────────────────────────────
@@ -174,84 +194,92 @@ def process_humming(
 # ──────────────────────────────────────────────
 
 def create_ui() -> gr.Blocks:
-    """
-    创建 Gradio Blocks 界面。
-
-    Returns:
-        gr.Blocks: Gradio 应用实例。
-    """
     with gr.Blocks(
         title="HummingMusic - 哼唱旋律风格迁移",
         theme=gr.themes.Soft(),
+        css="footer {visibility: hidden}",
     ) as app:
         gr.Markdown(
             """
-            # HummingMusic - 哼唱旋律风格迁移系统
-            哼唱一段旋律，选择目标风格，系统将自动转译并生成风格化音频。
+            # 🎶 HummingMusic — 哼唱旋律风格迁移
+            录一段哼唱或上传音频，选择目标风格，生成风格化音乐。
+            > 提示：如同时录制麦克风并上传文件，系统会**优先使用麦克风录音**。
             """
         )
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### 输入")
-
+                gr.Markdown("### 🎙️ 输入")
                 audio_mic = gr.Audio(
-                    sources=["microphone"],
-                    type="filepath",
-                    label="麦克风录音",
+                    sources=["microphone"], type="filepath",
+                    label="麦克风录音（优先）",
                 )
                 audio_upload = gr.Audio(
-                    sources=["upload"],
-                    type="filepath",
-                    label="上传音频 (WAV/MP3)",
+                    sources=["upload"], type="filepath",
+                    label="或上传音频 (WAV / MP3 / M4A)",
                 )
-
                 style_dropdown = gr.Dropdown(
-                    choices=["pop", "jazz", "classical", "folk"],
-                    value="pop",
-                    label="目标风格",
+                    choices=STYLE_CHOICES, value="pop",
+                    label="🎨 目标风格",
+                    info="共 4 种，决定生成结果的配器与节奏特征",
+                )
+                generate_btn = gr.Button(
+                    "🎵 生成", variant="primary", size="lg"
                 )
 
-                generate_btn = gr.Button(
-                    "生成", variant="primary", size="lg"
-                )
+                gr.Markdown("#### 💡 示例")
+                demo_root = Path(__file__).resolve().parent.parent / "data" / "demo"
+                example_wav = demo_root / "example.wav"
+                examples = []
+                if example_wav.exists():
+                    for s in ["pop", "jazz", "classical", "folk"]:
+                        examples.append([str(example_wav), s])
+                if examples:
+                    gr.Examples(
+                        examples=examples,
+                        inputs=[audio_upload, style_dropdown],
+                        label="点击任意示例载入",
+                    )
 
             with gr.Column(scale=2):
-                gr.Markdown("### 输出")
-
+                gr.Markdown("### 🎧 输出")
                 output_audio = gr.Audio(
-                    label="生成的音频",
-                    type="filepath",
-                    interactive=False,
+                    label="生成的音频", type="filepath", interactive=False,
                 )
-
                 piano_roll_img = gr.Image(
-                    label="Piano Roll 可视化",
-                    type="filepath",
+                    label="Piano Roll 可视化", type="filepath",
                 )
-
-                midi_download = gr.File(
-                    label="下载 MIDI 文件",
-                )
-
+                midi_download = gr.File(label="📥 下载 MIDI 文件")
                 status_text = gr.Textbox(
-                    label="处理状态",
-                    lines=5,
+                    label="处理状态", lines=10, max_lines=20,
                     interactive=False,
                 )
 
-        # 事件绑定：优先使用麦克风录音，其次使用上传文件
         def _get_audio_input(mic_audio, upload_audio):
             return mic_audio if mic_audio is not None else upload_audio
 
+        def _run(mic, upload, style):
+            return process_humming(_get_audio_input(mic, upload), style)
+
+        # Fix #2: lock → run → unlock 链式串行，并发被 queue 卡在 limit=1
         generate_btn.click(
-            fn=lambda mic, upload, style: process_humming(
-                _get_audio_input(mic, upload), style
-            ),
+            fn=_lock_button, inputs=None, outputs=generate_btn, queue=False
+        ).then(
+            fn=_run,
             inputs=[audio_mic, audio_upload, style_dropdown],
             outputs=[output_audio, piano_roll_img, midi_download, status_text],
+        ).then(
+            fn=_unlock_button, inputs=None, outputs=generate_btn, queue=False
         )
 
+        # Fix #10: 输入变更时提示结果已过期
+        for comp in (audio_mic, audio_upload, style_dropdown):
+            comp.change(
+                fn=_stale_warning, inputs=[audio_upload, style_dropdown],
+                outputs=status_text, queue=False,
+            )
+
+    app.queue(default_concurrency_limit=1)
     return app
 
 
