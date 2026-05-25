@@ -58,9 +58,12 @@ class HumTransDataset(Dataset):
         midi_dir: str,
         feat_dir: str | None = None,
         max_samples: int | None = None,
+        correct_octave: bool = True,
     ) -> None:
         split = split.upper()
         assert split in ("TRAIN", "VALID", "TEST"), f"无效 split: {split}"
+
+        self.correct_octave = correct_octave
 
         with open(split_json, "r", encoding="utf-8") as f:
             keys = json.load(f)[split]
@@ -128,11 +131,10 @@ class HumTransDataset(Dataset):
             feat_path = self.feat_dir / f"{key}.npy"
             if feat_path.exists():
                 feat = np.load(str(feat_path)).astype(np.float32)
-                return self._correct_octave_shift(feat, key)
+                return self._correct_octave_shift(feat, key) if self.correct_octave else feat
 
-        return self._correct_octave_shift(
-            self._extract_features_realtime(key), key
-        )
+        feat = self._extract_features_realtime(key)
+        return self._correct_octave_shift(feat, key) if self.correct_octave else feat
 
     def _correct_octave_shift(self, feat: np.ndarray, key: str) -> np.ndarray:
         """

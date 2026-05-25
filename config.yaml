@@ -35,7 +35,6 @@ style_transfer:
   pitch_low: 36
   pitch_high: 84
   frame_rate: 32
-  fast_chord_inference: true    # 使用轻量调性估计，避免 fallback 阶段调用 music21 全量分析
   codebook_size: 512
   embedding_dim: 64
   encoder_channels: [64, 128, 256]

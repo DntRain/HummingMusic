@@ -647,6 +647,7 @@ def _load_vqvae_model() -> StyleVQVAE | None:
 
     try:
         model = StyleVQVAE(
+            in_channels=_config["style_transfer"]["in_channels"],
             codebook_size=_config["style_transfer"]["codebook_size"],
             embedding_dim=_config["style_transfer"]["embedding_dim"],
         )
@@ -722,23 +723,37 @@ def transfer_style(
         return _fallback_transfer(midi, style)
 
     try:
-        # 编码
-        roll = midi_to_piano_roll(midi)
-        x = torch.from_numpy(roll).float().unsqueeze(0)  # (1, 128, T)
+        pitch_low = _config["style_transfer"]["pitch_low"]
+        pitch_high = _config["style_transfer"]["pitch_high"]
+        frame_rate = _config["style_transfer"]["frame_rate"]
+
+        # 提取 48 维 piano roll（C2–C6），二值化
+        roll128 = midi_to_piano_roll(midi, fs=frame_rate)  # (128, T)
+        roll48 = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)  # (48, T)
+
+        # T 需为 8 的倍数（3 层 stride-2）
+        T = roll48.shape[1]
+        pad = (8 - T % 8) % 8
+        if pad:
+            roll48 = np.pad(roll48, ((0, 0), (0, pad)))
+
+        x = torch.from_numpy(roll48).float().unsqueeze(0)  # (1, 48, T)
 
         with torch.no_grad():
-            z_q, indices = model.encode(x)
+            z_q, _ = model.encode(x)
 
-            # 风格条件注入：将风格向量加到潜在表示上
+            # 风格条件注入
             style_vec = torch.from_numpy(style_vectors[style]).float()
             style_vec = style_vec.unsqueeze(0).unsqueeze(-1)  # (1, D, 1)
             z_styled = z_q + style_vec.expand_as(z_q)
 
-            # 解码
-            recon = model.decode(z_styled)
+            recon48 = model.decode(z_styled)  # (1, 48, T)
 
-        # 转回MIDI
-        recon_roll = (recon.squeeze(0).numpy() * 127).clip(0, 127)
+        # 48 维结果映射回 128 维 piano roll
+        recon_roll48 = (recon48.squeeze(0).cpu().numpy()[:, :T] * 127).clip(0, 127)
+        recon_roll = np.zeros((128, T), dtype=np.float32)
+        recon_roll[pitch_low:pitch_high] = recon_roll48
+
         try:
             bpm = midi.estimate_tempo()
         except ValueError:

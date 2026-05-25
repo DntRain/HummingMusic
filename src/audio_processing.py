@@ -19,9 +19,18 @@ import yaml
 try:
     import crepe
     CREPE_AVAILABLE = True
-except Exception:
+except ImportError:
     crepe = None
     CREPE_AVAILABLE = False
+
+try:
+    import torch
+    import torchcrepe
+    TORCHCREPE_AVAILABLE = True
+except ImportError:
+    torch = None
+    torchcrepe = None
+    TORCHCREPE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -65,100 +74,110 @@ def _load_and_resample(audio_path: str) -> tuple[np.ndarray, int]:
     return y, sr
 
 
-def _extract_f0(
+def _extract_f0_crepe(
     audio: np.ndarray, sr: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    使用 CREPE 提取基频。
-
-    Args:
-        audio: 单声道音频信号。
-        sr: 采样率。
-
-    Returns:
-        tuple: (time, frequency, confidence)
-            - time (np.ndarray): 时间戳，shape=(N,)
-            - frequency (np.ndarray): F0频率(Hz)，shape=(N,)
-            - confidence (np.ndarray): 置信度[0,1]，shape=(N,)
-    """
-    if not CREPE_AVAILABLE:
-        logger.warning("CREPE/TensorFlow 不可用，改用 librosa.pyin fallback")
-        return _extract_f0_with_librosa(audio, sr)
-
     step_size = _config["crepe"]["step_size"]
     model_capacity = _config["crepe"]["model_capacity"]
     viterbi = _config["crepe"]["viterbi"]
 
-    try:
-        time, frequency, confidence, _ = crepe.predict(
-            audio,
-            sr,
-            model_capacity=model_capacity,
-            viterbi=viterbi,
-            step_size=step_size,
-        )
-        logger.info("CREPE 提取完成: %d 帧", len(time))
-        return time, frequency, confidence
-    except Exception as e:
-        logger.warning("CREPE 提取失败，改用 librosa.pyin fallback: %s", e)
-        return _extract_f0_with_librosa(audio, sr)
+    time, frequency, confidence, _ = crepe.predict(
+        audio,
+        sr,
+        model_capacity=model_capacity,
+        viterbi=viterbi,
+        step_size=step_size,
+    )
+
+    logger.info("CREPE 提取完成: %d 帧", len(time))
+    return time, frequency, confidence
 
 
-def _extract_f0_with_librosa(
+_TORCHCREPE_CAPACITY_MAP = {
+    "tiny": "tiny", "small": "tiny", "medium": "full",
+    "large": "full", "full": "full",
+}
+
+
+def _extract_f0_torchcrepe(
     audio: np.ndarray, sr: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    使用 librosa 的单声部音高估计作为 CREPE/TensorFlow 不可用时的 fallback。
+    """torchcrepe（PyTorch + GPU）实现，比官方 crepe 更快、无 TF 依赖。"""
+    step_ms = _config["crepe"]["step_size"]
+    capacity = _TORCHCREPE_CAPACITY_MAP.get(
+        _config["crepe"]["model_capacity"], "full")
+    viterbi = _config["crepe"]["viterbi"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
 
-    该路径质量弱于 CREPE，但足以保证本地 Web demo 和端到端流程可运行。
-    """
-    step_size = _config["crepe"]["step_size"]
-    hop_length = max(int(sr * step_size / 1000), 1)
-    frame_length = min(2048, max(256, 2 ** int(np.ceil(np.log2(hop_length * 4)))))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_t = torch.from_numpy(audio).float().unsqueeze(0)
+    decoder = (torchcrepe.decode.viterbi if viterbi
+               else torchcrepe.decode.argmax)
+    fmin = 50.0
+    fmax = torchcrepe.MAX_FMAX
+
+    with torch.no_grad():
+        pitch, periodicity = torchcrepe.predict(
+            audio_t, sr, hop_length, fmin, fmax,
+            model=capacity, batch_size=2048,
+            device=device, decoder=decoder, return_periodicity=True,
+        )
+
+    frequency = pitch.squeeze(0).cpu().numpy()
+    confidence = periodicity.squeeze(0).cpu().numpy()
+    time = np.arange(len(frequency)) * hop_length / sr
+    logger.info("torchcrepe(%s/%s) 提取完成: %d 帧",
+                capacity, device, len(time))
+    return time, frequency, confidence
+
+
+def _extract_f0_pyin(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """librosa.pyin 回退实现：用于无 CREPE/TensorFlow 的环境（如本机 benchmark）。"""
+    step_ms = _config["crepe"]["step_size"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
+    frame_length = max(hop_length * 4, 2048)
     fmin = librosa.note_to_hz("C2")
     fmax = librosa.note_to_hz("C7")
-
-    try:
-        frequency, voiced_flag, voiced_prob = librosa.pyin(
-            audio,
-            fmin=fmin,
-            fmax=fmax,
-            sr=sr,
-            frame_length=frame_length,
-            hop_length=hop_length,
-        )
-        confidence = np.where(voiced_flag, 0.95, 0.0).astype(np.float32)
-        confidence = np.maximum(confidence, np.nan_to_num(voiced_prob, nan=0.0))
-        frequency = frequency.astype(float)
-        frequency[~voiced_flag] = np.nan
-    except Exception as e:
-        logger.warning("librosa.pyin 失败，改用 librosa.yin: %s", e)
-        frequency = librosa.yin(
-            audio,
-            fmin=fmin,
-            fmax=fmax,
-            sr=sr,
-            frame_length=frame_length,
-            hop_length=hop_length,
-        ).astype(float)
-        rms = librosa.feature.rms(
-            y=audio,
-            frame_length=frame_length,
-            hop_length=hop_length,
-        )[0]
-        if np.max(rms) > 0:
-            confidence = (rms / np.max(rms)).astype(np.float32)
-        else:
-            confidence = np.zeros_like(frequency, dtype=np.float32)
-        frequency[confidence < 0.1] = np.nan
-
-    time = librosa.frames_to_time(
-        np.arange(len(frequency)),
-        sr=sr,
-        hop_length=hop_length,
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        audio, fmin=fmin, fmax=fmax, sr=sr,
+        frame_length=frame_length, hop_length=hop_length,
     )
-    logger.info("librosa F0 提取完成: %d 帧", len(time))
+    n = len(f0)
+    time = np.arange(n) * hop_length / sr
+    confidence = np.where(voiced_flag, voiced_prob, 0.0)
+    frequency = np.where(np.isnan(f0), 0.0, f0)
+    logger.info("pyin 提取完成: %d 帧", n)
     return time, frequency, confidence
+
+
+def _extract_f0(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """提取基频。
+
+    config.audio.pitch_backend = 'auto' | 'torchcrepe' | 'crepe' | 'pyin'
+    auto 优先级：torchcrepe > crepe > pyin。
+    """
+    backend = _config.get("audio", {}).get("pitch_backend", "auto")
+    if backend == "torchcrepe":
+        if not TORCHCREPE_AVAILABLE:
+            raise RuntimeError("config 指定 torchcrepe 但未安装")
+        return _extract_f0_torchcrepe(audio, sr)
+    if backend == "crepe":
+        if not CREPE_AVAILABLE:
+            raise RuntimeError("config 指定 crepe 但未安装")
+        return _extract_f0_crepe(audio, sr)
+    if backend == "pyin":
+        return _extract_f0_pyin(audio, sr)
+    # auto
+    if TORCHCREPE_AVAILABLE:
+        return _extract_f0_torchcrepe(audio, sr)
+    if CREPE_AVAILABLE:
+        return _extract_f0_crepe(audio, sr)
+    logger.warning("CREPE/torchcrepe 均不可用，回退到 librosa.pyin")
+    return _extract_f0_pyin(audio, sr)
 
 
 def _filter_low_confidence(
@@ -253,9 +272,6 @@ def _estimate_bpm(audio: np.ndarray, sr: int) -> float:
     tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
     # librosa >= 0.10 返回数组
     bpm = float(np.atleast_1d(tempo)[0])
-    if not np.isfinite(bpm) or bpm <= 0:
-        logger.warning("BPM 估计无效: %.1f，使用默认 120.0", bpm)
-        bpm = 120.0
     logger.info("BPM 估计: %.1f", bpm)
     return bpm
 
