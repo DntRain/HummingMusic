@@ -672,8 +672,9 @@ def _load_model() -> BiLSTMCRF | None:
             num_layers=_config["quantizer"]["num_layers"],
             dropout=_config["quantizer"]["dropout"],
         )
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        # ckpt 嵌套结构兼容：{epoch, model_state_dict, optimizer_state_dict, val_acc}
+        model.load_state_dict(state_dict.get("model_state_dict", state_dict))
         model.eval()
         _model = model
         logger.info("量化模型加载成功: %s", model_path)
