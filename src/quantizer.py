@@ -704,8 +704,9 @@ def _load_model() -> BiLSTMCRF | None:
             num_layers=_config["quantizer"]["num_layers"],
             dropout=_config["quantizer"]["dropout"],
         )
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        # ckpt 嵌套结构兼容：{epoch, model_state_dict, optimizer_state_dict, val_acc}
+        model.load_state_dict(state_dict.get("model_state_dict", state_dict))
         model.eval()
         _model = model
         logger.info("量化模型加载成功: %s", model_path)
@@ -739,6 +740,20 @@ def quantize_humming(pitch_data: dict) -> pretty_midi.PrettyMIDI:
         pretty_midi.PrettyMIDI: 量化后的MIDI对象，包含单个旋律轨道。
     """
     logger.info("开始哼唱量化")
+
+    # Bug-04 根因修复：有效帧占比 < 10% 时模型必然全 O 输出，直接短路省 0.2s
+    freq = pitch_data["frequency"]
+    n_total = len(freq)
+    n_valid = int(np.sum(~np.isnan(freq)))
+    valid_ratio = n_valid / max(n_total, 1)
+    if n_total == 0 or valid_ratio < 0.10:
+        logger.warning(
+            "有效帧占比仅 %.1f%%（%d/%d），跳过模型，返回空 MIDI",
+            valid_ratio * 100, n_valid, n_total,
+        )
+        empty = pretty_midi.PrettyMIDI(initial_tempo=pitch_data.get("bpm", 120.0))
+        empty.instruments.append(pretty_midi.Instrument(program=0, name="melody"))
+        return empty
 
     model = _load_model()
     if model is None:
