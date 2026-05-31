@@ -31,6 +31,7 @@ import matplotlib.patches as mpatches
 
 from train.dataset import HumTransDataset
 from src.quantizer import BiLSTMCRF, _bio_to_notes, _notes_to_midi
+from src.audio_processing import LowEnergyError, _check_rms_energy
 from train.metrics import compute_note_metrics
 
 # ──────────────────────────────────────────────
@@ -136,6 +137,7 @@ def extract_features_from_bytes(file_bytes: bytes, suffix: str) -> tuple[np.ndar
     train.extract_features.extract_one（CREPE 优先，pyin 回退）。
     """
     import subprocess
+    import librosa
     from train.extract_features import extract_one
 
     with tempfile.TemporaryDirectory() as td:
@@ -149,6 +151,10 @@ def extract_features_from_bytes(file_bytes: bytes, suffix: str) -> tuple[np.ndar
              "-ac", "1", "-ar", "16000", "-loglevel", "error", str(wav16)],
             check=True,
         )
+
+        # Bug-04 根因修复：CREPE 前先做能量门控，省 6-10s 空推理
+        audio_pcm, _ = librosa.load(str(wav16), sr=16000, mono=True)
+        _check_rms_energy(audio_pcm)
 
         if not extract_one("example", td_path, td_path, force=True):
             raise RuntimeError("特征提取失败（extract_one 返回 False）")
@@ -537,6 +543,11 @@ def run_style_transfer(midi_bytes: bytes, style: str,
     finally:
         os.unlink(tmp)
 
+    # Bug-04 根因修复：空 MIDI 直接返回空字节，UI 已在上游判 pred_n==0 拦截，
+    # 这里是 src/style_transfer 之外的第二道防线。
+    if sum(len(inst.notes) for inst in pm.instruments) == 0:
+        return b""
+
     roll128 = pm.get_piano_roll(fs=frame_rate)
     roll48  = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)
     T = roll48.shape[1]
@@ -761,6 +772,11 @@ if audio_source is not None:
             )
         st.success(f"✅ 特征提取完成：{upload_feat.shape[0]} 帧 "
                    f"({int((upload_feat[:, 1] > 0).sum())} 有效)")
+    except LowEnergyError as e:
+        # Bug-04 根因层：CREPE 前 RMS 能量门控触发，省去整条空推理链路
+        st.error(f"❌ 音频能量过低（{e.rms_dbfs:.1f} dBFS < {e.threshold_dbfs:.0f} dBFS）")
+        st.info("💡 建议：贴近麦克风、提高音量、安静环境下录制，时长 3–15s")
+        st.stop()
     except Exception as e:
         st.error(f"❌ 特征提取失败：{e}")
         st.stop()

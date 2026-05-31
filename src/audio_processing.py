@@ -39,6 +39,34 @@ _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
     _config = yaml.safe_load(_f)
 
+# Bug-04 根因修复：能量过低输入在 CREPE 前就拒掉，避免下游模型跑空推理。
+# 阈值 -50 dBFS 来自实测：常规室内说话 ~ -25 dBFS、轻哼 ~ -35 dBFS、
+# 静音/底噪 ~ -55 dBFS 以下。
+_MIN_RMS_DBFS = -50.0
+
+
+class LowEnergyError(ValueError):
+    """音频能量过低（静音 / 底噪 / 极弱哼唱），不足以进入推理链路。"""
+
+    def __init__(self, rms_dbfs: float, threshold_dbfs: float = _MIN_RMS_DBFS):
+        self.rms_dbfs = rms_dbfs
+        self.threshold_dbfs = threshold_dbfs
+        super().__init__(
+            f"音频 RMS 能量 {rms_dbfs:.1f} dBFS 低于阈值 {threshold_dbfs:.1f} dBFS"
+        )
+
+
+def _check_rms_energy(audio: np.ndarray) -> None:
+    """RMS 能量门控：低于 -50 dBFS 直接抛 LowEnergyError。"""
+    if audio.size == 0:
+        raise LowEnergyError(rms_dbfs=-np.inf)
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    # 0 dBFS = 满刻度；log10(0) 防溢出
+    rms_dbfs = 20.0 * np.log10(max(rms, 1e-10))
+    logger.info("RMS 能量检测: %.1f dBFS（阈值 %.1f）", rms_dbfs, _MIN_RMS_DBFS)
+    if rms_dbfs < _MIN_RMS_DBFS:
+        raise LowEnergyError(rms_dbfs=rms_dbfs)
+
 
 def _load_and_resample(audio_path: str) -> tuple[np.ndarray, int]:
     """
@@ -306,6 +334,9 @@ def extract_pitch(audio_path: str) -> dict:
 
     # 1. 加载并重采样
     audio, sr = _load_and_resample(audio_path)
+
+    # 1.5 Bug-04 根因修复：能量门控前置，省掉 CREPE 6-8s 推理
+    _check_rms_energy(audio)
 
     # 2. 提取F0
     time, frequency, confidence = _extract_f0(audio, sr)

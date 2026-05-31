@@ -649,6 +649,18 @@ def transfer_style(
 
     logger.info("开始风格迁移: 目标风格=%s", style)
 
+    # Bug-04 根因修复：输入无音符时直接返回空 MIDI，不跑 VQ-VAE encode（省 0.4s）
+    n_in_notes = sum(len(inst.notes) for inst in midi.instruments)
+    if n_in_notes == 0:
+        logger.warning("输入 MIDI 无音符，跳过 VQ-VAE，返回空 melody-only")
+        empty = pretty_midi.PrettyMIDI(initial_tempo=midi.resolution and 120.0 or 120.0)
+        empty.instruments.append(
+            pretty_midi.Instrument(
+                program=STYLE_PROGRAMS[style]["melody"], is_drum=False, name="melody"
+            )
+        )
+        return empty
+
     model = _load_vqvae_model()
     decoders = _load_style_decoders()
     style_vectors = _load_style_vectors()

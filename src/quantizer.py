@@ -709,6 +709,20 @@ def quantize_humming(pitch_data: dict) -> pretty_midi.PrettyMIDI:
     """
     logger.info("开始哼唱量化")
 
+    # Bug-04 根因修复：有效帧占比 < 10% 时模型必然全 O 输出，直接短路省 0.2s
+    freq = pitch_data["frequency"]
+    n_total = len(freq)
+    n_valid = int(np.sum(~np.isnan(freq)))
+    valid_ratio = n_valid / max(n_total, 1)
+    if n_total == 0 or valid_ratio < 0.10:
+        logger.warning(
+            "有效帧占比仅 %.1f%%（%d/%d），跳过模型，返回空 MIDI",
+            valid_ratio * 100, n_valid, n_total,
+        )
+        empty = pretty_midi.PrettyMIDI(initial_tempo=pitch_data.get("bpm", 120.0))
+        empty.instruments.append(pretty_midi.Instrument(program=0, name="melody"))
+        return empty
+
     model = _load_model()
     if model is None:
         baseline = RoundingBaselineQuantizer()
