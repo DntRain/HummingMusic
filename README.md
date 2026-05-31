@@ -50,15 +50,15 @@ sudo pacman -S fluidsynth soundfont-fluid
 ## 快速开始
 
 ```bash
-# 启动 Gradio Web 界面
-python -m src.app
+# 启动 Streamlit 前端
+streamlit run tools/visualizer.py --server.port 8501
 ```
 
-浏览器访问 `http://localhost:7860`，录音或上传哼唱音频，选择风格，点击"生成"。
+浏览器访问 `http://localhost:8501`，录音或上传哼唱音频，完成量化、可视化和风格迁移。
 
 ## 可视化工具
 
-BiLSTM-CRF 量化器交互式可视化（钢琴卷帘 + 音频对比 + 模型得分）：
+HummingMusic 交互式前端（钢琴卷帘 + 音频对比 + 模型得分 + 四风格迁移）：
 
 ```bash
 nohup /home/DontRain/Projects/YOLO11n_Furnas/python312/bin/streamlit run tools/visualizer.py --server.port 8501 --server.headless true > logs/visualizer.log 2>&1 &
@@ -106,8 +106,7 @@ HummingMusic/
 │   ├── audio_processing.py     # 音频处理：CREPE F0 提取 + 插值修复
 │   ├── quantizer.py            # 容错量化：BiLSTM-CRF 序列标注
 │   ├── style_transfer.py       # 风格迁移：VQ-VAE + music21 和弦推断
-│   ├── renderer.py             # 音频渲染：FluidSynth / pretty_midi
-│   └── app.py                  # Gradio Web 界面入口
+│   └── renderer.py             # 音频渲染：FluidSynth / pretty_midi
 ├── data/
 │   ├── humming/                # 哼唱音频数据
 │   ├── midi_pop/               # 流行风格 MIDI 参考库
