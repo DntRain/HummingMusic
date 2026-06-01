@@ -70,6 +70,57 @@ def midi_to_piano_roll(
     return roll
 
 
+def decode_recon_to_notes(
+    recon_prob: np.ndarray,
+    pitch_low: int,
+    pitch_high: int,
+    frame_dur: float,
+    prob_thresh: float = 0.2,
+    min_note_dur: float = 0.06,
+) -> list[pretty_midi.Note]:
+    """从 VQ-VAE decoder 输出的概率图切出单音 note 序列。
+
+    每帧取 argmax 单音；max(prob) < prob_thresh 的帧视为静音；
+    相邻同 pitch 帧合并为一个 note，时长 < min_note_dur 的丢弃，
+    避免 0.5 硬阈值在 confidence 偏低时产出全空 MIDI，以及 1-帧噪声音符。
+
+    Args:
+        recon_prob: shape=(pitch_high-pitch_low, T) 的相对音域概率图。
+        pitch_low/high: 模型音域对应的绝对 MIDI pitch 区间。
+        frame_dur: 每帧时长（秒）。
+        prob_thresh: 帧级活跃阈值（默认 0.2，原 0.5 过严）。
+        min_note_dur: 最短 note 时长（秒，默认 0.06 ≈ 16 分音符）。
+    """
+    if recon_prob.size == 0:
+        return []
+    T = recon_prob.shape[1]
+    max_prob = recon_prob.max(axis=0)
+    argmax_pitch = recon_prob.argmax(axis=0)
+    active = max_prob >= prob_thresh
+
+    notes: list[pretty_midi.Note] = []
+    i = 0
+    while i < T:
+        if not active[i]:
+            i += 1
+            continue
+        p_rel = int(argmax_pitch[i])
+        j = i + 1
+        while j < T and active[j] and int(argmax_pitch[j]) == p_rel:
+            j += 1
+        t_start = i * frame_dur
+        t_end = j * frame_dur
+        if t_end - t_start >= min_note_dur:
+            mean_p = float(recon_prob[p_rel, i:j].mean())
+            vel = max(1, min(127, int(round(mean_p * 127.0 * 1.4))))
+            notes.append(pretty_midi.Note(
+                velocity=vel, pitch=int(pitch_low + p_rel),
+                start=t_start, end=t_end,
+            ))
+        i = j
+    return notes
+
+
 def piano_roll_to_midi(
     roll: np.ndarray,
     bpm: float,
@@ -698,10 +749,6 @@ def transfer_style(
                 logger.info("用 style_vec 注入路径")
 
         recon_prob = recon.squeeze(0).cpu().numpy()[:, :T]
-        recon48 = np.where(recon_prob > 0.5,
-                           (recon_prob * 127).clip(1, 127), 0).astype(np.float32)
-        recon128 = np.zeros((128, T), dtype=np.float32)
-        recon128[pitch_low:pitch_high] = recon48
 
         try:
             bpm = midi.estimate_tempo()
@@ -714,20 +761,9 @@ def transfer_style(
         inst = pretty_midi.Instrument(
             program=STYLE_PROGRAMS[style]["melody"], is_drum=False, name="melody"
         )
-        for pitch in range(128):
-            active = recon128[pitch] > 0
-            if not np.any(active):
-                continue
-            changes = np.diff(active.astype(int))
-            starts = (np.concatenate([[0], np.where(changes == 1)[0] + 1])
-                      if active[0] else np.where(changes == 1)[0] + 1)
-            ends = (np.concatenate([np.where(changes == -1)[0] + 1, [T]])
-                    if active[-1] else np.where(changes == -1)[0] + 1)
-            for s, e in zip(starts, ends):
-                vel = max(1, min(127, int(np.mean(recon128[pitch, s:e]))))
-                inst.notes.append(
-                    pretty_midi.Note(vel, int(pitch), s * frame_dur, e * frame_dur)
-                )
+        inst.notes.extend(
+            decode_recon_to_notes(recon_prob, pitch_low, pitch_high, frame_dur)
+        )
         result.instruments.append(inst)
 
         logger.info("风格迁移完成（与 visualizer 一致：VQ-VAE 主路径 + melody-only）")

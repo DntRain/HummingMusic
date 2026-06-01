@@ -22,10 +22,11 @@ from src.style_transfer import STYLE_PROGRAMS
 
 
 CHORD_PROGRESSIONS = {
-    "pop": [0, 7, 9, 5],          # I  - V  - vi - IV  (C G Am F)
-    "jazz": [0, 9, 2, 7],         # Imaj7 - vi7 - ii7 - V7
-    "classical": [0, 5, 7, 0],    # I  - IV - V  - I
-    "folk": [0, 7, 0, 5],         # I  - V  - I  - IV
+    # 8 长度 = A 段 (前 4) + B 段 (后 4)，消除 4 和弦循环的机械感
+    "pop":       [0, 7, 9, 5,  5, 9, 7, 0],   # I-V-vi-IV ‖ IV-vi-V-I（B 段反走 + 收回主和弦）
+    "jazz":      [0, 9, 2, 7,  2, 7, 0, 9],   # Imaj7-vi7-ii7-V7 ‖ ii-V-I-vi（典型 ii-V 链）
+    "classical": [0, 5, 7, 0,  9, 5, 7, 0],   # I-IV-V-I ‖ vi-IV-V-I（B 段 vi 替代 I 作 deceptive）
+    "folk":      [0, 7, 0, 5,  9, 5, 0, 7],   # I-V-I-IV ‖ vi-IV-I-V（B 段 vi 增加色彩）
 }
 
 CHORD_TYPE = {
@@ -193,13 +194,20 @@ def _make_chord_track(style: str, key_root: int, total: float, beat_dur: float,
         dur = min(chord_dur, total - t)
 
         if style == "jazz":
-            # 慢琶音：每 2 拍弹一个音，整组持续到下个和弦
-            step = beat_dur * 2
-            for k in range(int(dur / step)):
-                p = pitches[k % len(pitches)]
-                inst.notes.append(pretty_midi.Note(
-                    velocity=50, pitch=p, start=t + k * step,
-                    end=min(t + (k + 1) * step + 0.3, t + dur)))
+            # Jazz comping：弱拍/反拍切分敲击整组七和弦
+            # 每 4 拍一个 Charleston-like pattern: 拍1 长敲 + 拍2.5 切分短敲 + 拍4 反拍短敲
+            n_bar = int(dur / (beat_dur * 4))
+            hits = [(0.0, 0.45, 56), (2.5, 0.25, 48), (3.5, 0.45, 52)]
+            for b in range(n_bar):
+                bar_t = b * beat_dur * 4
+                for off_beats, len_beats, vel in hits:
+                    n_start = t + bar_t + off_beats * beat_dur
+                    n_end = min(n_start + len_beats * beat_dur, t + dur)
+                    if n_end <= n_start:
+                        continue
+                    for p in pitches:
+                        inst.notes.append(pretty_midi.Note(
+                            velocity=vel, pitch=p, start=n_start, end=n_end))
         elif style == "classical":
             # Bug-08 修复：阿尔贝蒂原 sub=beat_dur（每拍 1 音），过密；
             # 改为 sub=beat_dur*2（每 2 拍 1 音），降到原密度的 50%，
@@ -237,28 +245,56 @@ def _make_bass_track(style: str, key_root: int, total: float, beat_dur: float,
     idx = 0
     chord_dur = beat_dur * 8
     while t < total:
-        root = 36 + (key_root + prog[idx % len(prog)]) % 12  # C2 起点
+        cur_root_pc = (key_root + prog[idx % len(prog)]) % 12
+        next_root_pc = (key_root + prog[(idx + 1) % len(prog)]) % 12
+        root = 36 + cur_root_pc                                   # C2 起点
         fifth = root + 7
+        third = root + 4
+        sixth = root + 9
+        seventh_flat = root + 10
         dur = min(chord_dur, total - t)
         n_beats = max(int(dur / beat_dur), 1)
-        for k in range(n_beats):
-            if style == "folk":
+
+        if style == "jazz":
+            # Walking bass：8 拍 pattern，1-3 拍 chord tones，4 拍半音 approach 下一根
+            # R - 3 - 5 - 6 - R+12 - 5 - 3 - approach（半音上下任一接近 next_root）
+            base_pat = [root, third, fifth, sixth, root + 12, fifth, third, root]
+            next_root_abs = 36 + next_root_pc
+            # approach 音：找离 next_root 半音邻近且不与 base_pat[-2] 相同
+            approach = next_root_abs - 1 if next_root_abs > base_pat[-2] else next_root_abs + 1
+            base_pat[-1] = approach
+            for k in range(n_beats):
+                p = base_pat[k % len(base_pat)]
+                note_end = min(t + (k + 1) * beat_dur - 0.02, t + dur)
+                inst.notes.append(pretty_midi.Note(
+                    velocity=60, pitch=p, start=t + k * beat_dur, end=note_end))
+        elif style == "classical":
+            # Alberti bass：8 分音符密度的 4 音分解
+            # pattern = [低-高-中-高] = [root, root+12, fifth, root+12]
+            pat = [root, root + 12, fifth, root + 12]
+            sub = beat_dur * 0.5  # 8 分音符
+            n_sub = int(dur / sub)
+            for k in range(n_sub):
+                p = pat[k % len(pat)]
+                note_end = min(t + (k + 1) * sub - 0.01, t + dur)
+                inst.notes.append(pretty_midi.Note(
+                    velocity=52, pitch=p, start=t + k * sub, end=note_end))
+        elif style == "folk":
+            # 交替低音：拍 1 root，拍 2 fifth，拍 3 root，拍 4 fifth
+            for k in range(n_beats):
                 p = root if k % 2 == 0 else fifth
-            elif style == "jazz":
-                p = [root, root + 4, fifth, fifth + 2][k % 4]   # walking
-            elif style == "classical":
-                # 古典低音半音符长音，只在 1、3 拍换
+                note_end = min(t + (k + 1) * beat_dur - 0.02, t + dur)
+                inst.notes.append(pretty_midi.Note(
+                    velocity=58, pitch=p, start=t + k * beat_dur, end=note_end))
+        else:  # pop: 1 拍 root，3 拍 fifth，半音符长音
+            for k in range(n_beats):
                 if k % 2 != 0:
                     continue
                 p = root if (k // 2) % 2 == 0 else fifth
-            else:  # pop: 1 拍 root，3 拍 fifth
-                if k % 2 != 0:
-                    continue
-                p = root if (k // 2) % 2 == 0 else fifth
-            note_end = t + (k + 2) * beat_dur if style in ("classical", "pop") else t + (k + 1) * beat_dur
-            note_end = min(note_end - 0.02, t + dur)
-            inst.notes.append(pretty_midi.Note(
-                velocity=58, pitch=p, start=t + k * beat_dur, end=note_end))
+                note_end = min(t + (k + 2) * beat_dur - 0.02, t + dur)
+                inst.notes.append(pretty_midi.Note(
+                    velocity=58, pitch=p, start=t + k * beat_dur, end=note_end))
+
         t += dur
         idx += 1
     return inst

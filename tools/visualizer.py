@@ -564,30 +564,18 @@ def run_style_transfer(midi_bytes: bytes, style: str,
         recon = decoders[style](z_q)
 
     recon_prob = recon.squeeze(0).numpy()[:, :T]
-    recon48 = np.where(recon_prob > 0.5,
-                       (recon_prob * 127).clip(1, 127), 0).astype(np.float32)
-    recon128 = np.zeros((128, T), dtype=np.float32)
-    recon128[pitch_low:pitch_high] = recon48
 
     try:
         bpm = pm.estimate_tempo()
     except ValueError:
         bpm = 120.0
     frame_dur = 1.0 / frame_rate
+    from src.style_transfer import decode_recon_to_notes
     melody_only = pretty_midi.PrettyMIDI(initial_tempo=bpm)
     inst = pretty_midi.Instrument(program=0, name="melody")
-    for pitch in range(128):
-        active = recon128[pitch] > 0
-        if not np.any(active):
-            continue
-        changes = np.diff(active.astype(int))
-        starts = (np.concatenate([[0], np.where(changes == 1)[0] + 1])
-                  if active[0] else np.where(changes == 1)[0] + 1)
-        ends = (np.concatenate([np.where(changes == -1)[0] + 1, [T]])
-                if active[-1] else np.where(changes == -1)[0] + 1)
-        for s, e in zip(starts, ends):
-            vel = max(1, min(127, int(np.mean(recon128[pitch, s:e]))))
-            inst.notes.append(pretty_midi.Note(vel, pitch, s * frame_dur, e * frame_dur))
+    inst.notes.extend(
+        decode_recon_to_notes(recon_prob, pitch_low, pitch_high, frame_dur)
+    )
     melody_only.instruments.append(inst)
 
     from src.style_postprocess import stylize

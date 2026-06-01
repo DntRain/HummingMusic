@@ -142,7 +142,7 @@ def test_style_transfer_empty_midi_short_circuit(monkeypatch):
 def test_cache_key_stable_for_same_bytes():
     """Streamlit @st.cache_data 用 hashlib.md5(bytes) 作 key；同字节必须同 key。"""
     import hashlib
-    blob = Path("/tmp/silence.wav").read_bytes()
+    blob = Path("/tmp/acc/silence.wav").read_bytes()
     h1 = hashlib.md5(blob).hexdigest()
     h2 = hashlib.md5(blob).hexdigest()
     assert h1 == h2
@@ -161,7 +161,7 @@ def test_local_audio_file_buffer_stable():
         def __init__(self, p): self.path = P(p); self.name = self.path.name
         def getbuffer(self): return memoryview(self.path.read_bytes())
 
-    f = _Stub("/tmp/silence.wav")
+    f = _Stub("/tmp/acc/silence.wav")
     b1 = f.getbuffer().tobytes()
     b2 = f.getbuffer().tobytes()
     assert b1 == b2
