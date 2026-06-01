@@ -300,6 +300,10 @@ def _estimate_bpm(audio: np.ndarray, sr: int) -> float:
     tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
     # librosa >= 0.10 返回数组
     bpm = float(np.atleast_1d(tempo)[0])
+    # 兜底：纯音/极短/无节拍输入 librosa 可能返回 0，下游 pretty_midi 会除零
+    if not np.isfinite(bpm) or bpm < 30.0:
+        logger.warning("BPM 估计无效（%.2f），回退到默认 120", bpm)
+        bpm = 120.0
     logger.info("BPM 估计: %.1f", bpm)
     return bpm
 
