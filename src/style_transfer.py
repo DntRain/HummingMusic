@@ -587,7 +587,6 @@ def _load_style_decoders() -> dict[str, Decoder]:
     每个 decoder 是 fine-tune 后的版本，能产出真正风格化输出，
     取代单 decoder + style_vec 的近似方案。
     """
-    global _style_decoders
     if _style_decoders:
         return _style_decoders
 

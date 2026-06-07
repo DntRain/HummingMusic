@@ -6,7 +6,6 @@ test_model_bugs.py - Week12 模型层 bug 修复回归测试
 - Bug-07 缓存：bytes 输入相同时 @st.cache_data hash 应一致（脱离 Streamlit 验证）
 """
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.audio_processing import LowEnergyError, _check_rms_energy
+from src.audio_processing import LowEnergyError, _check_rms_energy  # noqa: E402
 
 
 # ──────────────────────────────────────────────
@@ -139,10 +138,12 @@ def test_style_transfer_empty_midi_short_circuit(monkeypatch):
 # Bug-07: bytes 输入下 cache hash 应一致
 # ──────────────────────────────────────────────
 
-def test_cache_key_stable_for_same_bytes():
+def test_cache_key_stable_for_same_bytes(tmp_path):
     """Streamlit @st.cache_data 用 hashlib.md5(bytes) 作 key；同字节必须同 key。"""
     import hashlib
-    blob = Path("/tmp/acc/silence.wav").read_bytes()
+    wav = tmp_path / "sample.wav"
+    wav.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt fake-audio-bytes")
+    blob = wav.read_bytes()
     h1 = hashlib.md5(blob).hexdigest()
     h2 = hashlib.md5(blob).hexdigest()
     assert h1 == h2
@@ -151,17 +152,23 @@ def test_cache_key_stable_for_same_bytes():
     assert h1 == h3
 
 
-def test_local_audio_file_buffer_stable():
+def test_local_audio_file_buffer_stable(tmp_path):
     """_LocalAudioFile.getbuffer() 必须在多次调用下返回相同字节。"""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
     # 直接构造（跳过 Streamlit import）
     from pathlib import Path as P
 
     class _Stub:
-        def __init__(self, p): self.path = P(p); self.name = self.path.name
-        def getbuffer(self): return memoryview(self.path.read_bytes())
+        def __init__(self, p):
+            self.path = P(p)
+            self.name = self.path.name
 
-    f = _Stub("/tmp/acc/silence.wav")
+        def getbuffer(self):
+            return memoryview(self.path.read_bytes())
+
+    wav = tmp_path / "sample.wav"
+    wav.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt fake-audio-bytes")
+    f = _Stub(str(wav))
     b1 = f.getbuffer().tobytes()
     b2 = f.getbuffer().tobytes()
     assert b1 == b2

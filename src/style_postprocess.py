@@ -23,10 +23,11 @@ from src.style_transfer import STYLE_PROGRAMS
 
 CHORD_PROGRESSIONS = {
     # 8 长度 = A 段 (前 4) + B 段 (后 4)，消除 4 和弦循环的机械感
-    "pop":       [0, 7, 9, 5,  5, 9, 7, 0],   # I-V-vi-IV ‖ IV-vi-V-I（B 段反走 + 收回主和弦）
-    "jazz":      [0, 9, 2, 7,  2, 7, 0, 9],   # Imaj7-vi7-ii7-V7 ‖ ii-V-I-vi（典型 ii-V 链）
-    "classical": [0, 5, 7, 0,  9, 5, 7, 0],   # I-IV-V-I ‖ vi-IV-V-I（B 段 vi 替代 I 作 deceptive）
-    "folk":      [0, 7, 0, 5,  9, 5, 0, 7],   # I-V-I-IV ‖ vi-IV-I-V（B 段 vi 增加色彩）
+    # 每行前 4 = A 段，后 4 = B 段
+    "pop": [0, 7, 9, 5, 5, 9, 7, 0],        # I-V-vi-IV ‖ IV-vi-V-I（B 段反走 + 收回主和弦）
+    "jazz": [0, 9, 2, 7, 2, 7, 0, 9],       # Imaj7-vi7-ii7-V7 ‖ ii-V-I-vi（典型 ii-V 链）
+    "classical": [0, 5, 7, 0, 9, 5, 7, 0],  # I-IV-V-I ‖ vi-IV-V-I（B 段 vi 替代 I）
+    "folk": [0, 7, 0, 5, 9, 5, 0, 7],       # I-V-I-IV ‖ vi-IV-I-V（B 段 vi 增加色彩）
 }
 
 CHORD_TYPE = {
@@ -251,7 +252,6 @@ def _make_bass_track(style: str, key_root: int, total: float, beat_dur: float,
         fifth = root + 7
         third = root + 4
         sixth = root + 9
-        seventh_flat = root + 10
         dur = min(chord_dur, total - t)
         n_beats = max(int(dur / beat_dur), 1)
 
