@@ -23,12 +23,49 @@ except ImportError:
     crepe = None
     CREPE_AVAILABLE = False
 
+try:
+    import torch
+    import torchcrepe
+    TORCHCREPE_AVAILABLE = True
+except ImportError:
+    torch = None
+    torchcrepe = None
+    TORCHCREPE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # 加载配置
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
     _config = yaml.safe_load(_f)
+
+# Bug-04 根因修复：能量过低输入在 CREPE 前就拒掉，避免下游模型跑空推理。
+# 阈值 -50 dBFS 来自实测：常规室内说话 ~ -25 dBFS、轻哼 ~ -35 dBFS、
+# 静音/底噪 ~ -55 dBFS 以下。
+_MIN_RMS_DBFS = -50.0
+
+
+class LowEnergyError(ValueError):
+    """音频能量过低（静音 / 底噪 / 极弱哼唱），不足以进入推理链路。"""
+
+    def __init__(self, rms_dbfs: float, threshold_dbfs: float = _MIN_RMS_DBFS):
+        self.rms_dbfs = rms_dbfs
+        self.threshold_dbfs = threshold_dbfs
+        super().__init__(
+            f"音频 RMS 能量 {rms_dbfs:.1f} dBFS 低于阈值 {threshold_dbfs:.1f} dBFS"
+        )
+
+
+def _check_rms_energy(audio: np.ndarray) -> None:
+    """RMS 能量门控：低于 -50 dBFS 直接抛 LowEnergyError。"""
+    if audio.size == 0:
+        raise LowEnergyError(rms_dbfs=-np.inf)
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    # 0 dBFS = 满刻度；log10(0) 防溢出
+    rms_dbfs = 20.0 * np.log10(max(rms, 1e-10))
+    logger.info("RMS 能量检测: %.1f dBFS（阈值 %.1f）", rms_dbfs, _MIN_RMS_DBFS)
+    if rms_dbfs < _MIN_RMS_DBFS:
+        raise LowEnergyError(rms_dbfs=rms_dbfs)
 
 
 def _load_and_resample(audio_path: str) -> tuple[np.ndarray, int]:
@@ -65,25 +102,9 @@ def _load_and_resample(audio_path: str) -> tuple[np.ndarray, int]:
     return y, sr
 
 
-def _extract_f0(
+def _extract_f0_crepe(
     audio: np.ndarray, sr: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    使用 CREPE 提取基频。
-
-    Args:
-        audio: 单声道音频信号。
-        sr: 采样率。
-
-    Returns:
-        tuple: (time, frequency, confidence)
-            - time (np.ndarray): 时间戳，shape=(N,)
-            - frequency (np.ndarray): F0频率(Hz)，shape=(N,)
-            - confidence (np.ndarray): 置信度[0,1]，shape=(N,)
-    """
-    if not CREPE_AVAILABLE:
-        raise RuntimeError("crepe 未安装，无法提取音高")
-
     step_size = _config["crepe"]["step_size"]
     model_capacity = _config["crepe"]["model_capacity"]
     viterbi = _config["crepe"]["viterbi"]
@@ -98,6 +119,98 @@ def _extract_f0(
 
     logger.info("CREPE 提取完成: %d 帧", len(time))
     return time, frequency, confidence
+
+
+_TORCHCREPE_CAPACITY_MAP = {
+    "tiny": "tiny", "small": "tiny", "medium": "full",
+    "large": "full", "full": "full",
+}
+
+
+def _extract_f0_torchcrepe(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """torchcrepe（PyTorch + GPU）实现，比官方 crepe 更快、无 TF 依赖。"""
+    step_ms = _config["crepe"]["step_size"]
+    capacity = _TORCHCREPE_CAPACITY_MAP.get(
+        _config["crepe"]["model_capacity"], "full")
+    viterbi = _config["crepe"]["viterbi"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_t = torch.from_numpy(audio).float().unsqueeze(0)
+    # 注：torchcrepe 在 viterbi decoder 下返回的 periodicity 会塌缩到 ≈0
+    # （Bug-A），导致置信度过滤把全部帧滤掉、端到端产出 0 note。因此
+    # confidence 始终取 argmax periodicity（真实发声置信度）；viterbi=true
+    # 时改用 median 滤波平滑 pitch 轨迹，既保留平滑意图又不破坏 confidence。
+    fmin = 50.0
+    fmax = torchcrepe.MAX_FMAX
+
+    with torch.no_grad():
+        pitch, periodicity = torchcrepe.predict(
+            audio_t, sr, hop_length, fmin, fmax,
+            model=capacity, batch_size=2048,
+            device=device, decoder=torchcrepe.decode.argmax,
+            return_periodicity=True,
+        )
+        if viterbi:
+            pitch = torchcrepe.filter.median(pitch, 3)
+
+    frequency = pitch.squeeze(0).cpu().numpy()
+    confidence = periodicity.squeeze(0).cpu().numpy()
+    time = np.arange(len(frequency)) * hop_length / sr
+    logger.info("torchcrepe(%s/%s) 提取完成: %d 帧",
+                capacity, device, len(time))
+    return time, frequency, confidence
+
+
+def _extract_f0_pyin(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """librosa.pyin 回退实现：用于无 CREPE/TensorFlow 的环境（如本机 benchmark）。"""
+    step_ms = _config["crepe"]["step_size"]
+    hop_length = max(1, int(sr * step_ms / 1000.0))
+    frame_length = max(hop_length * 4, 2048)
+    fmin = librosa.note_to_hz("C2")
+    fmax = librosa.note_to_hz("C7")
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        audio, fmin=fmin, fmax=fmax, sr=sr,
+        frame_length=frame_length, hop_length=hop_length,
+    )
+    n = len(f0)
+    time = np.arange(n) * hop_length / sr
+    confidence = np.where(voiced_flag, voiced_prob, 0.0)
+    frequency = np.where(np.isnan(f0), 0.0, f0)
+    logger.info("pyin 提取完成: %d 帧", n)
+    return time, frequency, confidence
+
+
+def _extract_f0(
+    audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """提取基频。
+
+    config.audio.pitch_backend = 'auto' | 'torchcrepe' | 'crepe' | 'pyin'
+    auto 优先级：torchcrepe > crepe > pyin。
+    """
+    backend = _config.get("audio", {}).get("pitch_backend", "auto")
+    if backend == "torchcrepe":
+        if not TORCHCREPE_AVAILABLE:
+            raise RuntimeError("config 指定 torchcrepe 但未安装")
+        return _extract_f0_torchcrepe(audio, sr)
+    if backend == "crepe":
+        if not CREPE_AVAILABLE:
+            raise RuntimeError("config 指定 crepe 但未安装")
+        return _extract_f0_crepe(audio, sr)
+    if backend == "pyin":
+        return _extract_f0_pyin(audio, sr)
+    # auto
+    if TORCHCREPE_AVAILABLE:
+        return _extract_f0_torchcrepe(audio, sr)
+    if CREPE_AVAILABLE:
+        return _extract_f0_crepe(audio, sr)
+    logger.warning("CREPE/torchcrepe 均不可用，回退到 librosa.pyin")
+    return _extract_f0_pyin(audio, sr)
 
 
 def _filter_low_confidence(
@@ -192,6 +305,10 @@ def _estimate_bpm(audio: np.ndarray, sr: int) -> float:
     tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
     # librosa >= 0.10 返回数组
     bpm = float(np.atleast_1d(tempo)[0])
+    # 兜底：纯音/极短/无节拍输入 librosa 可能返回 0，下游 pretty_midi 会除零
+    if not np.isfinite(bpm) or bpm < 30.0:
+        logger.warning("BPM 估计无效（%.2f），回退到默认 120", bpm)
+        bpm = 120.0
     logger.info("BPM 估计: %.1f", bpm)
     return bpm
 
@@ -226,6 +343,9 @@ def extract_pitch(audio_path: str) -> dict:
 
     # 1. 加载并重采样
     audio, sr = _load_and_resample(audio_path)
+
+    # 1.5 Bug-04 根因修复：能量门控前置，省掉 CREPE 6-8s 推理
+    _check_rms_energy(audio)
 
     # 2. 提取F0
     time, frequency, confidence = _extract_f0(audio, sr)

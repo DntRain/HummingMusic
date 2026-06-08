@@ -442,10 +442,13 @@ class TestBaselineQuantizeLegacy:
 class TestQuantizeHumming:
     """quantize_humming 接口测试（无模型权重时使用 RoundingBaselineQuantizer）。"""
 
-    def test_fallback_mode(self):
+    def test_fallback_mode(self, monkeypatch):
         """模型未加载时应自动使用 RoundingBaselineQuantizer。"""
+        from src import quantizer
         from src.quantizer import quantize_humming
 
+        # 强制无模型，确定性走 baseline（避免本地存在 .pt 时走模型路径）
+        monkeypatch.setattr(quantizer, "_load_model", lambda: None)
         pitch_data = _make_pitch_data(duration=2.0)
         result = quantize_humming(pitch_data)
         assert isinstance(result, pretty_midi.PrettyMIDI)

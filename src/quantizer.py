@@ -672,8 +672,9 @@ def _load_model() -> BiLSTMCRF | None:
             num_layers=_config["quantizer"]["num_layers"],
             dropout=_config["quantizer"]["dropout"],
         )
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        # ckpt 嵌套结构兼容：{epoch, model_state_dict, optimizer_state_dict, val_acc}
+        model.load_state_dict(state_dict.get("model_state_dict", state_dict))
         model.eval()
         _model = model
         logger.info("量化模型加载成功: %s", model_path)
@@ -708,6 +709,20 @@ def quantize_humming(pitch_data: dict) -> pretty_midi.PrettyMIDI:
     """
     logger.info("开始哼唱量化")
 
+    # Bug-04 根因修复：有效帧占比 < 10% 时模型必然全 O 输出，直接短路省 0.2s
+    freq = pitch_data["frequency"]
+    n_total = len(freq)
+    n_valid = int(np.sum(~np.isnan(freq)))
+    valid_ratio = n_valid / max(n_total, 1)
+    if n_total == 0 or valid_ratio < 0.10:
+        logger.warning(
+            "有效帧占比仅 %.1f%%（%d/%d），跳过模型，返回空 MIDI",
+            valid_ratio * 100, n_valid, n_total,
+        )
+        empty = pretty_midi.PrettyMIDI(initial_tempo=pitch_data.get("bpm", 120.0))
+        empty.instruments.append(pretty_midi.Instrument(program=0, name="melody"))
+        return empty
+
     model = _load_model()
     if model is None:
         baseline = RoundingBaselineQuantizer()
@@ -726,6 +741,19 @@ def quantize_humming(pitch_data: dict) -> pretty_midi.PrettyMIDI:
     # BIO → 音符事件
     midi_notes = _freq_to_midi(pitch_data["frequency"])
     notes = _bio_to_notes(tags, pitch_data["time"], midi_notes)
+
+    # 退化模型守卫：当前 bilstm_crf.pt 的 onset(B) 类被训练压死（类别不
+    # 平衡，emission B logit 恒最低），对真实哼唱产出 0 note。此时回退
+    # baseline 量化器，保证端到端可用。根治需重训（类别加权/focal loss）。
+    # 详见 reports/week14/xyk/regression_report.md。
+    if len(notes) == 0:
+        n_valid = int(np.sum(~np.isnan(midi_notes)))
+        if n_valid > 0:
+            logger.warning(
+                "模型未产出音符（%d 有效帧，疑似 onset 类退化），回退 baseline",
+                n_valid,
+            )
+            return RoundingBaselineQuantizer()(pitch_data)
 
     logger.info("量化完成: %d 个音符", len(notes))
 

@@ -70,6 +70,57 @@ def midi_to_piano_roll(
     return roll
 
 
+def decode_recon_to_notes(
+    recon_prob: np.ndarray,
+    pitch_low: int,
+    pitch_high: int,
+    frame_dur: float,
+    prob_thresh: float = 0.2,
+    min_note_dur: float = 0.06,
+) -> list[pretty_midi.Note]:
+    """从 VQ-VAE decoder 输出的概率图切出单音 note 序列。
+
+    每帧取 argmax 单音；max(prob) < prob_thresh 的帧视为静音；
+    相邻同 pitch 帧合并为一个 note，时长 < min_note_dur 的丢弃，
+    避免 0.5 硬阈值在 confidence 偏低时产出全空 MIDI，以及 1-帧噪声音符。
+
+    Args:
+        recon_prob: shape=(pitch_high-pitch_low, T) 的相对音域概率图。
+        pitch_low/high: 模型音域对应的绝对 MIDI pitch 区间。
+        frame_dur: 每帧时长（秒）。
+        prob_thresh: 帧级活跃阈值（默认 0.2，原 0.5 过严）。
+        min_note_dur: 最短 note 时长（秒，默认 0.06 ≈ 16 分音符）。
+    """
+    if recon_prob.size == 0:
+        return []
+    T = recon_prob.shape[1]
+    max_prob = recon_prob.max(axis=0)
+    argmax_pitch = recon_prob.argmax(axis=0)
+    active = max_prob >= prob_thresh
+
+    notes: list[pretty_midi.Note] = []
+    i = 0
+    while i < T:
+        if not active[i]:
+            i += 1
+            continue
+        p_rel = int(argmax_pitch[i])
+        j = i + 1
+        while j < T and active[j] and int(argmax_pitch[j]) == p_rel:
+            j += 1
+        t_start = i * frame_dur
+        t_end = j * frame_dur
+        if t_end - t_start >= min_note_dur:
+            mean_p = float(recon_prob[p_rel, i:j].mean())
+            vel = max(1, min(127, int(round(mean_p * 127.0 * 1.4))))
+            notes.append(pretty_midi.Note(
+                velocity=vel, pitch=int(pitch_low + p_rel),
+                start=t_start, end=t_end,
+            ))
+        i = j
+    return notes
+
+
 def piano_roll_to_midi(
     roll: np.ndarray,
     bpm: float,
@@ -527,6 +578,37 @@ def _generate_chord_progression(
 # ──────────────────────────────────────────────
 
 _vqvae_model: StyleVQVAE | None = None
+_style_decoders: dict[str, Decoder] = {}
+
+
+def _load_style_decoders() -> dict[str, Decoder]:
+    """加载 4 个风格独立 decoder（decoder_{style}.pt，与 visualizer 同源）。
+
+    每个 decoder 是 fine-tune 后的版本，能产出真正风格化输出，
+    取代单 decoder + style_vec 的近似方案。
+    """
+    if _style_decoders:
+        return _style_decoders
+
+    cfg = _config["style_transfer"]
+    dec_dir = Path(cfg["style_vectors_dir"])
+    in_channels = cfg["in_channels"]
+    embedding_dim = cfg["embedding_dim"]
+    for style in VALID_STYLES:
+        dec_path = dec_dir / f"decoder_{style}.pt"
+        if not dec_path.exists():
+            logger.warning("风格 decoder 不存在: %s", dec_path)
+            continue
+        try:
+            dec = Decoder(out_channels=in_channels, embedding_dim=embedding_dim)
+            sd = torch.load(str(dec_path), map_location="cpu", weights_only=False)
+            dec.load_state_dict(sd.get("model_state_dict", sd))
+            dec.eval()
+            _style_decoders[style] = dec
+            logger.info("已加载风格 decoder: %s", dec_path)
+        except Exception as e:
+            logger.error("加载 decoder %s 失败: %s", dec_path, e)
+    return _style_decoders
 
 
 def _load_vqvae_model() -> StyleVQVAE | None:
@@ -547,11 +629,13 @@ def _load_vqvae_model() -> StyleVQVAE | None:
 
     try:
         model = StyleVQVAE(
+            in_channels=_config["style_transfer"]["in_channels"],
             codebook_size=_config["style_transfer"]["codebook_size"],
             embedding_dim=_config["style_transfer"]["embedding_dim"],
         )
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        # ckpt 嵌套结构兼容：{epoch, model_state_dict, optimizer_state_dict, val_loss}
+        model.load_state_dict(state_dict.get("model_state_dict", state_dict))
         model.eval()
         _vqvae_model = model
         logger.info("VQ-VAE 模型加载成功: %s", model_path)
@@ -615,40 +699,73 @@ def transfer_style(
 
     logger.info("开始风格迁移: 目标风格=%s", style)
 
+    # Bug-04 根因修复：输入无音符时直接返回空 MIDI，不跑 VQ-VAE encode（省 0.4s）
+    n_in_notes = sum(len(inst.notes) for inst in midi.instruments)
+    if n_in_notes == 0:
+        logger.warning("输入 MIDI 无音符，跳过 VQ-VAE，返回空 melody-only")
+        empty = pretty_midi.PrettyMIDI(initial_tempo=midi.resolution and 120.0 or 120.0)
+        empty.instruments.append(
+            pretty_midi.Instrument(
+                program=STYLE_PROGRAMS[style]["melody"], is_drum=False, name="melody"
+            )
+        )
+        return empty
+
     model = _load_vqvae_model()
+    decoders = _load_style_decoders()
     style_vectors = _load_style_vectors()
 
-    if model is None or style not in style_vectors:
+    if model is None or (style not in decoders and style not in style_vectors):
         return _fallback_transfer(midi, style)
 
     try:
-        # 编码
-        roll = midi_to_piano_roll(midi)
-        x = torch.from_numpy(roll).float().unsqueeze(0)  # (1, 128, T)
+        cfg = _config["style_transfer"]
+        pitch_low, pitch_high = cfg["pitch_low"], cfg["pitch_high"]
+        frame_rate = cfg["frame_rate"]
+
+        roll128 = midi.get_piano_roll(fs=frame_rate)
+        roll48 = (roll128[pitch_low:pitch_high] > 0).astype(np.float32)
+
+        T = roll48.shape[1]
+        if T < 32:
+            roll48 = np.pad(roll48, ((0, 0), (0, 32 - T)))
+            T = 32
+        pad = (8 - T % 8) % 8
+        if pad:
+            roll48 = np.pad(roll48, ((0, 0), (0, pad)))
+
+        x = torch.from_numpy(roll48).float().unsqueeze(0)
 
         with torch.no_grad():
-            z_q, indices = model.encode(x)
+            z_q, _ = model.encode(x)
+            if style in decoders:
+                recon = decoders[style](z_q)
+                logger.info("用 decoder_%s.pt 主路径", style)
+            else:
+                style_vec = torch.from_numpy(style_vectors[style]).float()
+                style_vec = style_vec.unsqueeze(0).unsqueeze(-1)
+                recon = model.decode(z_q + style_vec.expand_as(z_q))
+                logger.info("用 style_vec 注入路径")
 
-            # 风格条件注入：将风格向量加到潜在表示上
-            style_vec = torch.from_numpy(style_vectors[style]).float()
-            style_vec = style_vec.unsqueeze(0).unsqueeze(-1)  # (1, D, 1)
-            z_styled = z_q + style_vec.expand_as(z_q)
+        recon_prob = recon.squeeze(0).cpu().numpy()[:, :T]
 
-            # 解码
-            recon = model.decode(z_styled)
-
-        # 转回MIDI
-        recon_roll = (recon.squeeze(0).numpy() * 127).clip(0, 127)
         try:
             bpm = midi.estimate_tempo()
         except ValueError:
             bpm = 120.0
-        result = piano_roll_to_midi(recon_roll, bpm)
 
-        # 添加伴奏
-        result = _infer_chords_and_add_accompaniment(result, style)
+        # 与 visualizer 完全一致：frame_dur = 1 / frame_rate，melody-only，不接 stylize
+        frame_dur = 1.0 / frame_rate
+        result = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+        inst = pretty_midi.Instrument(
+            program=STYLE_PROGRAMS[style]["melody"], is_drum=False, name="melody"
+        )
+        inst.notes.extend(
+            decode_recon_to_notes(recon_prob, pitch_low, pitch_high, frame_dur)
+        )
+        result.instruments.append(inst)
 
-        logger.info("风格迁移完成")
+        logger.info("风格迁移完成（与 visualizer 一致：VQ-VAE 主路径 + melody-only）")
         return result
 
     except Exception as e:

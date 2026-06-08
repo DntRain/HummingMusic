@@ -8,9 +8,9 @@ audio:
 # CREPE 音高提取
 crepe:
   model_capacity: "full"       # tiny, small, medium, large, full
-  confidence_threshold: 0.8
+  confidence_threshold: 0.5    # 哼唱 torchcrepe(argmax) periodicity 中等，0.8 太严会滤掉过多帧
   step_size: 10                # 帧步长(ms)
-  viterbi: true
+  viterbi: true                # true=对 pitch 做 median 平滑（不再用 viterbi decoder，见 _extract_f0_torchcrepe）
 
 # 插值参数
 interpolation:
@@ -24,13 +24,17 @@ quantizer:
   dropout: 0.3
   use_crf: true
   # baseline 量化器参数
-  confidence_threshold: 0.8    # 低于此值的帧视为静音
+  confidence_threshold: 0.5    # 低于此值的帧视为静音（哼唱 torchcrepe 置信度中等，0.8 太严会滤掉 ~90%）
   silence_threshold: 0.2       # 短于此时长(秒)的静音段做插值填充
   default_velocity: 80         # baseline 输出音符的统一力度
 
 # 风格迁移
 style_transfer:
   model_path: "models/style_transfer/vqvae.pt"
+  in_channels: 48
+  pitch_low: 36
+  pitch_high: 84
+  frame_rate: 32
   codebook_size: 512
   embedding_dim: 64
   encoder_channels: [64, 128, 256]

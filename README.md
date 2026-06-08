@@ -50,15 +50,15 @@ sudo pacman -S fluidsynth soundfont-fluid
 ## 快速开始
 
 ```bash
-# 启动 Gradio Web 界面
-python -m src.app
+# 启动 Streamlit 前端
+streamlit run tools/visualizer.py --server.port 8501
 ```
 
-浏览器访问 `http://localhost:7860`，录音或上传哼唱音频，选择风格，点击"生成"。
+浏览器访问 `http://localhost:8501`，录音或上传哼唱音频，完成量化、可视化和风格迁移。
 
 ## 可视化工具
 
-BiLSTM-CRF 量化器交互式可视化（钢琴卷帘 + 音频对比 + 模型得分）：
+HummingMusic 交互式前端（钢琴卷帘 + 音频对比 + 模型得分 + 四风格迁移）：
 
 ```bash
 nohup /home/DontRain/Projects/YOLO11n_Furnas/python312/bin/streamlit run tools/visualizer.py --server.port 8501 --server.headless true > logs/visualizer.log 2>&1 &
@@ -90,12 +90,31 @@ nohup /home/DontRain/Projects/YOLO11n_Furnas/python312/bin/streamlit run tools/v
 ## 运行测试
 
 ```bash
-# 运行全部测试
+# 运行全部测试（当前 96 passed）
 pytest tests/ -v
 
 # 带覆盖率报告
 pytest tests/ -v --cov=src --cov-report=term-missing
+
+# 仅跑 week14 回归套件
+pytest tests/test_regression_week14.py -v
 ```
+
+> CI（`.github/workflows/ci.yml`）在每次 PR 自动运行 flake8 + 全量 pytest。
+> CI 环境不安装 torch/crepe（由 `tests/conftest.py` mock）、不含模型权重，
+> 量化器自动走 baseline 路径，因此 CI 全绿不代表模型层端到端可用，详见「已知问题」。
+
+## 已知问题与修复状态（截至 2026-06-08, week14）
+
+week14 回归发现真实哼唱端到端曾产出 0 notes，根因定位为两层缺陷，**同日已修复/缓解**，端到端已恢复产出（example 样本 299~558 note）。回归用例 `RC-24` 已由 xfail 转 PASS 守在 CI。
+
+| 缺陷 | 层 | 现象 | 状态 |
+|---|---|---|---|
+| **Bug-A** | 音高 | torchcrepe 在 viterbi decoder 下 periodicity 塌缩（max≈0.30），置信度阈值 0.8 滤掉 100% 帧 → 空 MIDI | ✅ **已修**：confidence 改用 argmax periodicity，`viterbi:true` 改为对 pitch 做 median 平滑；阈值对齐为 0.5 |
+| **Bug-B** | 模型 | `bilstm_crf.pt` 推理 emission 层 onset(B) 类被压死（类别不平衡），产 0 note；同输入 baseline 可产 300+ note | ⚠️ **已缓解**：模型产 0 note 时自动回退 baseline 量化器。**根治待重训**（类别加权 / focal loss 提升 B 召回） |
+
+> Bug-B 根治前，量化走 baseline 路径（音乐性弱于模型预期但端到端可用）。
+> 详见 `reports/week14/xyk/regression_report.md`。
 
 ## 项目结构
 
@@ -106,8 +125,7 @@ HummingMusic/
 │   ├── audio_processing.py     # 音频处理：CREPE F0 提取 + 插值修复
 │   ├── quantizer.py            # 容错量化：BiLSTM-CRF 序列标注
 │   ├── style_transfer.py       # 风格迁移：VQ-VAE + music21 和弦推断
-│   ├── renderer.py             # 音频渲染：FluidSynth / pretty_midi
-│   └── app.py                  # Gradio Web 界面入口
+│   └── renderer.py             # 音频渲染：FluidSynth / pretty_midi
 ├── data/
 │   ├── humming/                # 哼唱音频数据
 │   ├── midi_pop/               # 流行风格 MIDI 参考库
