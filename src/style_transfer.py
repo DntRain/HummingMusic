@@ -10,6 +10,8 @@ style_transfer.py - 风格迁移模块
 """
 
 import logging
+import copy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -362,6 +364,61 @@ def _load_style_vectors() -> dict[str, np.ndarray]:
 # music21 和弦推断与伴奏生成
 # ──────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _SimpleTonic:
+    midi: int
+
+
+@dataclass(frozen=True)
+class _SimpleKey:
+    tonic: _SimpleTonic
+    mode: str
+
+
+_MAJOR_KEY_PROFILE = np.array(
+    [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+    dtype=np.float32,
+)
+_MINOR_KEY_PROFILE = np.array(
+    [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+    dtype=np.float32,
+)
+
+
+def _estimate_key_fast(midi: pretty_midi.PrettyMIDI) -> _SimpleKey:
+    """Estimate a lightweight key object without depending on music21."""
+    pitch_hist = np.zeros(12, dtype=np.float32)
+    for inst in midi.instruments:
+        if inst.is_drum:
+            continue
+        for note in inst.notes:
+            duration = max(float(note.end - note.start), 0.01)
+            pitch_hist[note.pitch % 12] += duration
+
+    if float(pitch_hist.sum()) <= 0.0:
+        return _SimpleKey(tonic=_SimpleTonic(0), mode="major")
+
+    pitch_hist = pitch_hist / pitch_hist.sum()
+    best_root = 0
+    best_mode = "major"
+    best_score = -float("inf")
+
+    for root in range(12):
+        major_score = float(np.dot(pitch_hist, np.roll(_MAJOR_KEY_PROFILE, root)))
+        if major_score > best_score:
+            best_root = root
+            best_mode = "major"
+            best_score = major_score
+
+        minor_score = float(np.dot(pitch_hist, np.roll(_MINOR_KEY_PROFILE, root)))
+        if minor_score > best_score:
+            best_root = root
+            best_mode = "minor"
+            best_score = minor_score
+
+    return _SimpleKey(tonic=_SimpleTonic(best_root), mode=best_mode)
+
+
 def _infer_chords_and_add_accompaniment(
     midi: pretty_midi.PrettyMIDI, style: str
 ) -> pretty_midi.PrettyMIDI:
@@ -613,7 +670,7 @@ def _fallback_transfer(
         pretty_midi.PrettyMIDI: 添加了伴奏的MIDI。
     """
     logger.warning("使用 fallback 风格迁移（模型未加载），仅添加伴奏")
-    return _infer_chords_and_add_accompaniment(midi, style)
+    return _infer_chords_and_add_accompaniment(copy.deepcopy(midi), style)
 
 
 # ──────────────────────────────────────────────

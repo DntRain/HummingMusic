@@ -139,10 +139,12 @@ def test_style_transfer_empty_midi_short_circuit(monkeypatch):
 # Bug-07: bytes 输入下 cache hash 应一致
 # ──────────────────────────────────────────────
 
-def test_cache_key_stable_for_same_bytes():
+def test_cache_key_stable_for_same_bytes(tmp_path):
     """Streamlit @st.cache_data 用 hashlib.md5(bytes) 作 key；同字节必须同 key。"""
     import hashlib
-    blob = Path("/tmp/silence.wav").read_bytes()
+    audio_path = tmp_path / "silence.wav"
+    audio_path.write_bytes(b"stable-silence-audio-bytes")
+    blob = audio_path.read_bytes()
     h1 = hashlib.md5(blob).hexdigest()
     h2 = hashlib.md5(blob).hexdigest()
     assert h1 == h2
@@ -151,7 +153,7 @@ def test_cache_key_stable_for_same_bytes():
     assert h1 == h3
 
 
-def test_local_audio_file_buffer_stable():
+def test_local_audio_file_buffer_stable(tmp_path):
     """_LocalAudioFile.getbuffer() 必须在多次调用下返回相同字节。"""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
     # 直接构造（跳过 Streamlit import）
@@ -161,7 +163,9 @@ def test_local_audio_file_buffer_stable():
         def __init__(self, p): self.path = P(p); self.name = self.path.name
         def getbuffer(self): return memoryview(self.path.read_bytes())
 
-    f = _Stub("/tmp/silence.wav")
+    audio_path = tmp_path / "silence.wav"
+    audio_path.write_bytes(b"stable-silence-audio-bytes")
+    f = _Stub(audio_path)
     b1 = f.getbuffer().tobytes()
     b2 = f.getbuffer().tobytes()
     assert b1 == b2

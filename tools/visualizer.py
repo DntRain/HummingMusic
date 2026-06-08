@@ -51,7 +51,7 @@ _SF2_CANDIDATES = [
     str(Path(__file__).parent.parent.parent /
         "YOLO11n_Furnas/python312/lib/python3.12/site-packages/pretty_midi/TimGM6mb.sf2"),
 ]
-SF2_PATH    = next(p for p in _SF2_CANDIDATES if Path(p).exists())
+SF2_PATH    = next((p for p in _SF2_CANDIDATES if Path(p).exists()), None)
 SYNTH_SR    = 22050
 
 DEMO_DIR    = Path(__file__).parent.parent / "data" / "demo"
@@ -220,8 +220,14 @@ def synthesize_midi(midi_bytes: bytes, instrument_name: str = "Acoustic Grand Pi
         for inst in pm.instruments:
             if not inst.is_drum:
                 inst.program = program
-        with _silence_stderr_fd():
-            audio = pm.fluidsynth(fs=SYNTH_SR, sf2_path=SF2_PATH)
+        try:
+            if SF2_PATH:
+                with _silence_stderr_fd():
+                    audio = pm.fluidsynth(fs=SYNTH_SR, sf2_path=SF2_PATH)
+            else:
+                audio = pm.synthesize(fs=SYNTH_SR)
+        except Exception:
+            audio = pm.synthesize(fs=SYNTH_SR)
         if np.abs(audio).max() > 0:
             audio = audio / np.abs(audio).max() * 0.9
         buf = io.BytesIO()
