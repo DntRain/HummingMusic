@@ -250,19 +250,49 @@ class TestRC_StyleTransfer:
 
 
 # ══════════════════════════════════════════════════════════
-# RC-24  端到端已知缺陷（Bug-A + Bug-B）：真实哼唱产出 0 notes
-#         skipif：CI 无 m4a/torch；xfail：本地复现已知失败
+# RC-24  端到端验收（Bug-A + Bug-B 已修）：真实哼唱产出 note
+#         skipif：CI 无 m4a/torch；本地应 PASS
 # ══════════════════════════════════════════════════════════
 
 @pytest.mark.skipif(not REAL_AUDIO.exists(),
-                    reason="CI 无真实音频样本；本地复现用")
-@pytest.mark.xfail(reason="Bug-A(viterbi periodicity 塌缩)+Bug-B(模型不出 B 标签)"
-                          "导致真实哼唱 quantize 产出 0 notes，待修",
-                   strict=False)
+                    reason="CI 无真实音频样本；本地端到端验收用")
 def test_rc24_real_humming_produces_notes():
-    """RC-24: 真实哼唱端到端应产出 note（当前因 Bug-A/B 失败 → xfail）。"""
+    """RC-24: 真实哼唱端到端应产出 note。
+
+    Bug-A（argmax periodicity + 阈值 0.5）恢复音高层；Bug-B（退化模型
+    回退 baseline）保证量化产出。修复后此用例由 xfail 转 PASS。
+    """
     from src.audio_processing import extract_pitch
     from src.quantizer import quantize_humming
     pd = extract_pitch(str(REAL_AUDIO))
     midi = quantize_humming(pd)
     assert sum(len(i.notes) for i in midi.instruments) > 0
+
+
+# ══════════════════════════════════════════════════════════
+# RC-25~26  缺陷修复守卫（CI-safe）
+# ══════════════════════════════════════════════════════════
+
+def test_rc25_degenerate_model_falls_back(monkeypatch):
+    """RC-25: 模型产 0 note（onset 退化）时回退 baseline 产出 note（Bug-B 守卫）。"""
+    class _DegenerateModel:
+        """模拟退化模型：所有帧标 I（tag 2），无 B。"""
+        def __call__(self, x):
+            seq_len = x.shape[1]
+            return [[BIO_TAGS["I"]] * seq_len]
+
+    monkeypatch.setattr(_q, "_load_model", lambda: _DegenerateModel())
+    midi = _q.quantize_humming(_pitch_data(duration=2.0))
+    notes = sum(len(i.notes) for i in midi.instruments)
+    assert notes > 0  # 回退 baseline 产出
+    assert midi.instruments[0].notes[0].velocity == 80  # baseline 力度特征
+
+
+def test_rc26_confidence_threshold_humming_tuned():
+    """RC-26: 置信度阈值已对齐哼唱（0.5），中等置信度帧不被误滤（Bug-A）。"""
+    from src.audio_processing import _config
+    assert _config["crepe"]["confidence_threshold"] <= 0.5
+    freq = np.full(10, 440.0)
+    conf = np.full(10, 0.6)  # 中等置信度，应保留
+    out = _filter_low_confidence(freq, conf)
+    assert np.allclose(out, 440.0)

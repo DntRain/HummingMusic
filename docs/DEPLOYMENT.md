@@ -42,9 +42,10 @@ models/style_transfer/{pop,jazz,classical,folk}_vector.npy  # 风格参考向量
 ```
 
 - 缺任一权重时对应模块**自动回退**，pipeline 仍可端到端运行。
-- ⚠️ **已知问题**：当前 `bilstm_crf.pt` 推理退化（不产 onset），真实哼唱
-  产出 0 notes。临时兜底为**移走该权重强制 baseline**。详见
-  `reports/week14/xyk/regression_report.md` 与 README「已知问题」。
+- ⚠️ **已知限制**：当前 `bilstm_crf.pt` 推理退化（onset 类被压死，不产 B）。
+  量化器已内置**退化守卫**：模型产 0 note 时自动回退 baseline，端到端正常
+  产出（音乐性弱于模型预期）。根治待重训。详见
+  `reports/week14/xyk/regression_report.md` 与 README「已知问题与修复状态」。
 
 ## 4. SoundFont（FluidSynth 合成）
 
@@ -99,7 +100,7 @@ location / {
 ## 7. 部署前自检
 
 ```bash
-pytest tests/ -q                 # 期望 93 passed, 1 xfailed
+pytest tests/ -q                 # 期望 96 passed（CI 无 m4a 时 95 passed,1 skipped）
 flake8 src/ tests/ --ignore=E501,W503 --count   # 期望 0
 python -c "import torch, torchcrepe, librosa, pretty_midi; print('deps ok')"
 ```
@@ -111,7 +112,7 @@ python -c "import torch, torchcrepe, librosa, pretty_midi; print('deps ok')"
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 真实哼唱产出 0 notes | Bug-A/Bug-B（见 README 已知问题） | 移走 `bilstm_crf.pt` 走 baseline |
+| 真实哼唱产出 0 notes | Bug-A/Bug-B（已修，需 `@b3460fa`+ 后版本） | 升级代码；退化守卫会自动回退 baseline |
 | `ZeroDivisionError` BPM | 纯音/极短输入 | 已修（回退 120），升级到 `@353cabd`+ |
 | fluidsynth `illegal option` | 2.5+ 参数顺序 | 选项放 SF2 之前 |
 | `not a SoundFont` | SF2 路径错/缺失 | 见 §4，或接受 pretty_midi 回退 |

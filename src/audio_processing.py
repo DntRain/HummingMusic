@@ -139,8 +139,10 @@ def _extract_f0_torchcrepe(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     audio_t = torch.from_numpy(audio).float().unsqueeze(0)
-    decoder = (torchcrepe.decode.viterbi if viterbi
-               else torchcrepe.decode.argmax)
+    # 注：torchcrepe 在 viterbi decoder 下返回的 periodicity 会塌缩到 ≈0
+    # （Bug-A），导致置信度过滤把全部帧滤掉、端到端产出 0 note。因此
+    # confidence 始终取 argmax periodicity（真实发声置信度）；viterbi=true
+    # 时改用 median 滤波平滑 pitch 轨迹，既保留平滑意图又不破坏 confidence。
     fmin = 50.0
     fmax = torchcrepe.MAX_FMAX
 
@@ -148,8 +150,11 @@ def _extract_f0_torchcrepe(
         pitch, periodicity = torchcrepe.predict(
             audio_t, sr, hop_length, fmin, fmax,
             model=capacity, batch_size=2048,
-            device=device, decoder=decoder, return_periodicity=True,
+            device=device, decoder=torchcrepe.decode.argmax,
+            return_periodicity=True,
         )
+        if viterbi:
+            pitch = torchcrepe.filter.median(pitch, 3)
 
     frequency = pitch.squeeze(0).cpu().numpy()
     confidence = periodicity.squeeze(0).cpu().numpy()

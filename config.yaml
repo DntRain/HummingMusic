@@ -8,9 +8,9 @@ audio:
 # CREPE 音高提取
 crepe:
   model_capacity: "full"       # tiny, small, medium, large, full
-  confidence_threshold: 0.8
+  confidence_threshold: 0.5    # 哼唱 torchcrepe(argmax) periodicity 中等，0.8 太严会滤掉过多帧
   step_size: 10                # 帧步长(ms)
-  viterbi: true
+  viterbi: true                # true=对 pitch 做 median 平滑（不再用 viterbi decoder，见 _extract_f0_torchcrepe）
 
 # 插值参数
 interpolation:
