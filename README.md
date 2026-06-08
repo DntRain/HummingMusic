@@ -90,12 +90,33 @@ nohup /home/DontRain/Projects/YOLO11n_Furnas/python312/bin/streamlit run tools/v
 ## 运行测试
 
 ```bash
-# 运行全部测试
+# 运行全部测试（当前 93 passed + 1 xfailed）
 pytest tests/ -v
 
 # 带覆盖率报告
 pytest tests/ -v --cov=src --cov-report=term-missing
+
+# 仅跑 week14 回归套件
+pytest tests/test_regression_week14.py -v
 ```
+
+> CI（`.github/workflows/ci.yml`）在每次 PR 自动运行 flake8 + 全量 pytest。
+> CI 环境不安装 torch/crepe（由 `tests/conftest.py` mock）、不含模型权重，
+> 量化器自动走 baseline 路径，因此 CI 全绿不代表模型层端到端可用，详见「已知问题」。
+
+## 已知问题（截至 2026-06-08, week14）
+
+真实哼唱端到端当前**产出 0 notes**，存在两层未修复缺陷（回归用例
+`RC-24` 已以 xfail 编码，修复后将自动转 XPASS 作为验收信号）：
+
+| 缺陷 | 层 | 现象 | 建议方向 |
+|---|---|---|---|
+| **Bug-A** | 音高 | `config.yaml crepe.viterbi: true` 使 torchcrepe periodicity 塌缩（max≈0.30），置信度阈值 0.8 滤掉 100% 帧 → 空 MIDI | confidence 与 viterbi 解码解耦；或对齐为哼唱用 0.5 阈值并清理重复配置 |
+| **Bug-B** | 模型 | `bilstm_crf.pt` 推理 tag 全为 O/I、无 B（onset），`_bio_to_notes` 产 0 note；同输入 baseline 可产 327 note | 核对训练-推理特征一致性 / CRF 转移矩阵；必要时重训 |
+
+> 临时兜底：删除/移走 `models/quantizer/bilstm_crf.pt` 可强制走 baseline 量化器，
+> 端到端能产出可用 note（音乐性弱于模型预期）。详见
+> `reports/week14/xyk/regression_report.md`。
 
 ## 项目结构
 
